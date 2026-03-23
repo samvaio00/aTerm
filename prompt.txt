@@ -1,0 +1,759 @@
+================================================================================
+  NATIVE macOS TERMINAL EMULATOR — FULL BUILD PROMPT
+  Smart terminal. Flexible AI. No backend. Fully open source.
+================================================================================
+
+PROJECT OVERVIEW
+----------------
+You are building a native macOS terminal emulator that combines the polish of
+iTerm2 with the AI intelligence of Warp, but with full model flexibility and no
+vendor lock-in. Every user brings their own API keys or subscription tokens.
+No backend server. No billing. No telemetry. Everything runs locally on the
+user's machine.
+
+Target platform : macOS (native, Apple Silicon + Intel universal binary)
+Stack           : Swift + SwiftUI frontend, SwiftNIO or custom PTY in Swift,
+                  or Tauri 2.x (Rust backend + WKWebView + xterm.js frontend)
+                  — choose the approach that gives the most native macOS feel.
+                  Prefer a native Swift/SwiftUI approach if PTY and xterm.js
+                  can be bridged cleanly. Otherwise use Tauri with WKWebView
+                  and native macOS window chrome.
+Shell           : zsh (real PTY, not a shell emulator)
+Distribution    : Homebrew cask + direct DMG download, MIT or Apache 2.0 license
+AI layer        : Direct HTTP calls from the app to model provider APIs.
+                  The app never proxies or stores user credentials.
+                  All API keys stored in macOS Keychain (SecItemAdd/SecItemCopy).
+
+Read every phase completely before writing any code.
+Complete each phase fully and confirm it works before moving to the next.
+
+================================================================================
+PHASE 1 — PROJECT SCAFFOLD + NATIVE PTY CORE
+================================================================================
+
+Goals:
+- Create the macOS app project (Xcode project or Tauri with WKWebView)
+- Spawn a real zsh PTY using macOS posix_openpt / forkpty
+- Bridge PTY stdin/stdout/stderr to the UI layer via async streams
+- xterm.js (if using web renderer) or a native Swift terminal view renders output
+- Keyboard input from the UI is forwarded to PTY stdin
+- Window resize events send correct TIOCSWINSZ to the PTY
+- The app launches, opens a real zsh session, and you can type real shell commands
+
+Constraints:
+- Must use a real PTY (forkpty or posix_openpt). No shell runner hacks.
+- zsh path is detected from /etc/shells or the $SHELL environment variable.
+- The PTY inherits the user's full environment: PATH, HOME, USER, TERM, etc.
+- TERM must be set to xterm-256color.
+- PTY exit is handled gracefully: show "[session ended — press any key to restart]"
+
+Deliverables:
+- Full project scaffold compilable and runnable on macOS
+- A zsh session opens on launch and accepts real input
+- Resize propagates correctly (test by running `resize` in the shell)
+- No crashes on PTY exit
+
+
+
+================================================================================
+PHASE 2 — ZSH INTEGRATION + TERMINAL UI
+================================================================================
+
+Goals:
+- Full zsh compatibility: .zshrc sourced, oh-my-zsh works, Powerlevel10k works
+- If using xterm.js: enable Unicode11Addon, WebLinksAddon, SearchAddon,
+  WebglRenderer (fallback to CanvasRenderer if WebGL unavailable)
+- If using native Swift renderer: full VT100/VT220/xterm-256color support,
+  Unicode, OSC sequences, sixel optional
+- Detect whether a Nerd Font is active; show a dismissable one-time banner if
+  not (Powerlevel10k and oh-my-zsh themes need Nerd Fonts for icons)
+- Multi-tab support: each tab is a completely independent PTY + zsh session
+- Tab title auto-updates to the current working directory using OSC 7 escape
+  sequence or shell precmd hook — no polling
+- Scrollback buffer: 10,000 lines per tab (configurable in settings)
+- Tab bar: new tab button, close button per tab, drag to reorder
+- Each tab maintains full independent state (cwd, history, scrollback)
+- Command-T opens new tab. Command-W closes current tab.
+- Tabs persist across app restores (store session state, restore cwd on relaunch)
+
+Constraints:
+- .zshrc must be sourced exactly as it would be in a login shell
+- ZDOTDIR must be respected for users who customise their zsh config path
+- All standard zsh features must work: aliases, functions, completions,
+  zsh-autosuggestions, zsh-syntax-highlighting, any zsh plugin
+
+Deliverables:
+- Multi-tab terminal where each tab is fully independent zsh
+- Tab titles update live as you cd
+- Nerd Font detection and banner
+
+
+
+================================================================================
+PHASE 3 — THEMES, FONTS, AND CUSTOMISATION
+================================================================================
+
+Goals:
+- Import and apply iTerm2 .itermcolors theme files directly
+  (.itermcolors is XML with 22 named color slots — parse and map to terminal
+  color palette: Ansi 0-15, background, foreground, selection, bold, cursor)
+- Ship 12 built-in themes: Dracula, Nord, Catppuccin Mocha, Tokyo Night,
+  Gruvbox Dark, Solarized Dark, Solarized Light, One Dark, Monokai,
+  Material Dark, Rosé Pine, and a custom default theme
+- In-app theme browser: grid of previews rendered in a mini terminal view,
+  live preview on hover, one-click apply
+- Download themes from iterm2colorschemes.com catalog within the app
+  (fetch the GitHub repo index, display, download on demand)
+- Font picker: lists all monospace fonts installed on the system
+  (use NSFontManager to enumerate families, filter to monospace)
+- Separate font setting for ASCII and non-ASCII characters (iTerm2 parity)
+- Font size, line height, letter spacing sliders with live preview
+- macOS vibrancy/transparency: NSVisualEffectView blur behind terminal content
+  with configurable opacity (0–100%)
+- Cursor styles: block, bar, underline — each with optional blink
+- Padding: configurable inner margin (top, bottom, left, right)
+- Window chrome: hide/show tab bar when single tab, traffic light button style
+
+Profiles system:
+- Named profiles stored in ~/Library/Application Support/[AppName]/profiles.json
+- Each profile contains: name, theme path, font, font size, opacity, blur,
+  padding, cursor style, scrollback size, shell path, zshrc path,
+  custom env vars, default working directory, AI provider, AI model
+- Default profile applied to new tabs
+- Per-tab profile switching (change profile for just this tab)
+- Project-level profile override: app reads .termconfig in cwd when tab opens,
+  applies specified profile or overrides automatically
+- Import/export profiles as JSON
+
+.termconfig file format (per-project, checked in or gitignored):
+  [profile]
+  name = "work"
+  provider = "anthropic"
+  model = "claude-sonnet-4-5"
+  mcp_servers = ["filesystem", "git"]
+
+Deliverables:
+- .itermcolors import works for any theme from iterm2colorschemes.com
+- In-app theme browser with live preview
+- Profile system with per-tab switching and .termconfig auto-detection
+- Vibrancy/transparency working on macOS
+- Font picker showing all system monospace fonts
+
+
+
+================================================================================
+PHASE 4 — PROVIDER ABSTRACTION + CREDENTIAL VAULT
+================================================================================
+
+Goals:
+Build the universal model provider layer. Every AI call in the app — whether
+from the input classifier, the query responder, or agent orchestration — goes
+through this single abstraction. The app never stores credentials in plaintext.
+
+Provider data model:
+  struct ModelProvider {
+    id: String            // unique slug, e.g. "anthropic"
+    name: String          // display name
+    endpoint: String      // full URL to chat completions endpoint
+    authType: AuthType    // bearer | x-api-key | oauth_token | none
+    apiFormat: ApiFormat  // openai_compatible | anthropic | gemini | custom
+    models: [ModelDefinition]
+    customHeaders: [String: String]  // optional
+  }
+
+  struct ModelDefinition {
+    id: String            // sent in API call
+    name: String          // display name
+    contextWindow: Int
+    supportsStreaming: Bool
+  }
+
+  enum AuthType { bearer, xApiKey, oauthToken, none }
+  enum ApiFormat { openAICompatible, anthropic, gemini, custom }
+
+Built-in presets (endpoint pre-filled, user adds key):
+  - Anthropic          https://api.anthropic.com/v1/messages           (x-api-key)
+  - OpenAI             https://api.openai.com/v1/chat/completions      (bearer)
+  - Google Gemini      https://generativelanguage.googleapis.com/...   (bearer)
+  - Mistral            https://api.mistral.ai/v1/chat/completions      (bearer)
+  - Groq               https://api.groq.com/openai/v1/chat/completions (bearer)
+  - OpenRouter         https://openrouter.ai/api/v1/chat/completions   (bearer)
+  - Together AI        https://api.together.xyz/v1/chat/completions    (bearer)
+  - Kimi               https://api.moonshot.cn/v1/chat/completions     (bearer)
+  - DeepSeek           https://api.deepseek.com/v1/chat/completions    (bearer)
+  - Ollama (local)     http://localhost:11434/v1/chat/completions      (none)
+  - llama.cpp (local)  http://localhost:8080/v1/chat/completions       (none)
+  - Custom             user fills all fields
+
+Credential storage:
+  - ALL API keys and OAuth tokens stored in macOS Keychain ONLY
+  - Service name: "com.[appname].providers"
+  - Account name: provider id
+  - Never written to disk, plist, or any file
+  - Retrieved via SecItemCopyMatching at call time
+  - UI shows **** for stored keys, offers update/delete
+
+Custom provider UI:
+  + Add Provider
+    ├── [Select preset or "Custom"]
+    ├── Name, Endpoint URL
+    ├── Auth type selector
+    ├── API key field (stored to Keychain on save, never shown again)
+    ├── Custom headers (key/value pairs, + Add row)
+    ├── Model list (manual entry: id + display name + context window)
+    └── [Test Connection] — fires a minimal test call, shows latency + model response
+
+Normalisation layer:
+  - All providers normalised to OpenAI chat completions format for dispatch
+  - Anthropic adapter: converts messages array to Anthropic format,
+    maps max_tokens, adds anthropic-version header
+  - Gemini adapter: converts to Gemini generateContent format
+  - Streaming: SSE parsing for all providers, normalised to delta chunks
+
+Global model switcher:
+  - Command+M opens a floating model picker overlay
+  - Shows all configured providers and their models
+  - Fuzzy search across all model names
+  - Selected model applies to current tab only
+  - Status bar shows active provider + model name at all times
+
+Per-project model config via .termconfig:
+  [ai]
+  provider = "anthropic"
+  model = "claude-sonnet-4-5"
+  classifier_model = "claude-haiku-4-5"  # cheaper model for classification
+
+Deliverables:
+  - All built-in presets work
+  - Custom provider add flow works end to end
+  - Test Connection gives clear pass/fail with error message
+  - Keys stored in Keychain, never on disk
+  - Model switcher overlay works
+  - Streaming responses work for at least Anthropic and OpenAI
+
+
+
+================================================================================
+PHASE 5 — SMART INPUT CLASSIFIER
+================================================================================
+
+Goals:
+Build the core intelligence layer. Every line the user submits is classified
+before anything executes. Classification must be fast, transparent, and
+correctable. The AI is never involved if the input is unambiguous.
+
+The three modes:
+
+  TERMINAL — execute directly, zero AI involvement
+    Examples: ls -la, git status, cd ~/projects, npm install, python script.py
+    Rule: input parses as valid shell syntax AND the first token is a known
+    binary, shell builtin, or path starting with / ./ ../
+    Behaviour: sent to PTY stdin immediately, no latency, no API call
+
+  AI→SHELL — natural language converted to a shell command, shown for confirmation
+    Examples: "find all files modified in the last 3 days larger than 1MB"
+              "kill whatever is running on port 3000"
+              "compress this folder with today's date as the filename"
+              "show which process is using the most memory"
+    Rule: reads as an instruction with a clear system action implied
+    Behaviour:
+      1. Classify (local heuristic or cheap model call)
+      2. Call AI to generate the shell command
+      3. Display the generated command with [Run] and [Edit] buttons
+      4. User confirms before ANYTHING executes
+      5. NEVER auto-execute AI-generated shell commands silently
+
+  QUERY — answer inline, no shell involved
+    Examples: "what does the -r flag do in rm"
+              "explain this error: ECONNREFUSED 127.0.0.1:5432"
+              "what is the difference between CMD and ENTRYPOINT in Docker"
+              "why would postgres say too many connections"
+    Rule: interrogative phrasing, no clear system action implied
+    Behaviour: AI answers inline in a collapsible styled block below the prompt
+
+Classification logic (run locally first, API only for ambiguous cases):
+
+  Step 1 — try to parse as shell syntax
+    Use a lightweight shell lexer (not a full parser).
+    If the first token exists in $PATH or is a shell builtin → TERMINAL
+    Shell builtins: cd, echo, export, source, alias, unset, fg, bg, jobs,
+                    kill, exit, history, pwd, pushd, popd, type, which, eval
+
+  Step 2 — check for interrogative words
+    If input starts with: what, why, how, explain, describe, tell me,
+    what's, whats, what is, what are, why is, why does, how do, how does,
+    how can, can you explain, could you explain → lean QUERY
+
+  Step 3 — check for action verb + system noun
+    Action verbs: find, show, list, kill, stop, start, restart, move, copy,
+                  delete, remove, compress, extract, create, make, open,
+                  check, monitor, watch, tail, grep, search, count, sort
+    System nouns: files, file, folder, directory, process, port, service,
+                  logs, disk, memory, cpu, network, connection, socket,
+                  permissions, ownership, symlink, archive, package
+    If action verb + system noun present → lean AI→SHELL
+
+  Step 4 — ambiguous: send to classifier model with context
+    System prompt: "You are a terminal input classifier. Classify the input
+    as exactly one of: TERMINAL, AI_TO_SHELL, or QUERY. Reply with only the
+    classification word. Context: cwd={cwd}, last_command={last_cmd},
+    last_output_snippet={last_50_chars_of_output}"
+    Use the cheapest/fastest model configured (default: haiku or equivalent)
+    Cache classifications for identical inputs in session
+
+  Step 5 — if model returns ambiguous or neither: show disambiguation UI
+    "Did you mean:  [⚡ run as shell command]  [? answer as query]"
+
+Context awareness for better classification:
+  - Pass current working directory to classifier
+  - Pass last 3 commands run in session
+  - Pass last error output if the previous command failed
+  - This context is a compact prefix, not a full conversation
+
+Visual treatment:
+  - Plain $ prompt → TERMINAL mode (no decoration)
+  - ⚡ prefix → AI→SHELL pending (show generated command for confirmation)
+  - ? prefix → QUERY mode (inline answer block, collapsible)
+  - Mode indicator in status bar shows current classification
+
+Manual override prefixes (user can force a mode):
+  !  at start of input → force QUERY regardless of content
+  >  at start of input → force AI→SHELL regardless of content
+  $  at start of input → force TERMINAL regardless of content
+
+AI→SHELL confirmation UI:
+  ┌─ Generated command ──────────────────────────────┐
+  │  find . -mtime -3 -size +1M -type f              │
+  │                              [Edit]  [Run ↵]     │
+  └──────────────────────────────────────────────────┘
+  - [Edit] opens the command in an inline editor before running
+  - [Run] or Enter executes
+  - Escape cancels, returns to input
+  - The generated command is fully editable before execution
+
+QUERY answer UI:
+  ┌─ ? ──────────────────────────────────────────────┐
+  │  Streaming answer text here...                   │
+  │                                       [Collapse] │
+  └──────────────────────────────────────────────────┘
+  - Streams inline below the prompt
+  - Does not scroll the terminal history
+  - Collapsible after answer completes
+  - Code blocks inside answers are syntax-highlighted
+  - If the answer suggests a command, that command has a [Run] button
+
+Deliverables:
+  - Local classifier correctly handles at least 85% of inputs without API call
+  - AI→SHELL flow works end to end with confirmation UI
+  - QUERY mode answers stream inline
+  - Manual override prefixes work
+  - Context-aware classification works (test: run a failing command,
+    then type "what's wrong" — should classify as QUERY about the error)
+
+
+
+================================================================================
+PHASE 6 — CODING AGENT RUNTIME
+================================================================================
+
+Goals:
+The terminal manages coding agents (Claude Code, Kimi Code, Codex CLI,
+OpenClaw, Aider, etc.) as named sessions alongside regular shell sessions.
+Each agent runs as a managed subprocess with its own PTY and lifecycle.
+
+Agent registry — define agents in config, ship with known agents pre-filled:
+
+  struct AgentDefinition {
+    id: String               // "claude-code"
+    name: String             // "Claude Code"
+    command: String          // "claude"
+    args: [String]           // []
+    authEnvVar: String       // "ANTHROPIC_API_KEY" — injected from Keychain
+    installCheck: String     // "which claude"
+    installHint: String      // "npm install -g @anthropic-ai/claude-code"
+    protocol: AgentProtocol  // interactiveCLI
+  }
+
+Built-in agent definitions:
+  - Claude Code    command: claude      auth: ANTHROPIC_API_KEY
+  - Kimi Code      command: kimi-code   auth: KIMI_API_KEY
+  - OpenAI Codex   command: codex       auth: OPENAI_API_KEY
+  - OpenClaw       command: openclaw    auth: OPENCLAW_API_KEY (or custom)
+  - Aider          command: aider       auth: OPENAI_API_KEY
+  - Custom         user fills all fields
+
+Custom agent support:
+  User can add any agent via:
+    Name, command (binary path or name), args template, auth env var name,
+    working directory override, any additional env vars
+
+Agent lifecycle management:
+  - [+ Agent] button in tab bar opens agent picker overlay
+  - Selecting an agent opens it in a new tab
+  - The tab is visually distinguished from shell tabs (icon or color accent)
+  - Agent process runs in cwd of the current shell tab (or user-specified path)
+  - Auth env var pulled from Keychain and injected into subprocess env at spawn
+    — the agent process receives its API key via environment, never via config file
+  - Crash detection: monitor process exit code
+    If exit != 0 → show "[agent exited with code N — Restart?]" banner
+  - Auto-restart option per agent (off by default)
+  - Graceful shutdown: SIGTERM first, SIGKILL after 3s if still running
+
+Auto-detection on launch:
+  - Scan $PATH for all known agent binaries (which claude, which codex, etc.)
+  - Show detected agents as available in the agent picker
+  - Show undetected agents as greyed out with install hint
+  - One-click to copy the install command to clipboard
+
+Per-project agent config in .termconfig:
+  [agents]
+  default = "claude-code"
+  auto_start = true           # open default agent tab when this project opens
+
+Deliverables:
+  - Claude Code launches in a new tab with ANTHROPIC_API_KEY injected from Keychain
+  - Custom agent add flow works
+  - Auto-detection scan works on launch
+  - Crash recovery banner works
+  - At least two different agents can run simultaneously in separate tabs
+
+
+
+================================================================================
+PHASE 7 — MCP HOST LAYER
+================================================================================
+
+Goals:
+The app is a full MCP (Model Context Protocol) host. It spawns and manages
+MCP servers, maintains their lifecycles, and exposes their tool surfaces to
+active agents and to the built-in AI classifier/query layer.
+
+MCP server types supported:
+  1. stdio transport — app spawns the server process, communicates via stdin/stdout
+  2. SSE transport  — app connects to a running HTTP server via Server-Sent Events
+  3. Local socket   — Unix domain socket (optional, lower priority)
+
+MCP server registry — stored in config, ship with known servers pre-filled:
+
+  struct MCPServerDefinition {
+    id: String
+    name: String
+    transport: MCPTransport      // stdio | sse
+    // For stdio:
+    command: String
+    args: [String]               // supports {cwd} template variable
+    // For SSE:
+    endpoint: String
+    autoStart: Bool              // start when app launches
+    scope: MCPScope              // global | perProject
+  }
+
+Built-in server definitions:
+  - filesystem   npx -y @modelcontextprotocol/server-filesystem {cwd}   stdio  autoStart
+  - git          npx -y @modelcontextprotocol/server-git --repository {cwd}  stdio  autoStart
+  - github       npx -y @modelcontextprotocol/server-github              stdio
+  - sqlite       npx -y @modelcontextprotocol/server-sqlite              stdio
+  - openclaw     openclaw serve                                           stdio
+  - Custom SSE   user provides endpoint URL
+
+MCP host implementation:
+  - Implement MCP client protocol (JSON-RPC 2.0 over stdio or SSE)
+  - On connect: send initialize request, receive server capabilities + tool list
+  - Maintain tool registry: map of tool name → server id
+  - Expose combined tool list to any active agent or AI call
+  - Handle tool call routing: AI requests tool X → find server → forward → return result
+  - Reconnection: if stdio server crashes, restart after 2s backoff (max 5 retries)
+  - Show "[server-name restarted]" notice in affected tabs on reconnect
+
+Server lifecycle UI (sidebar panel or settings pane):
+  MCP Servers
+  ──────────────────────
+  ● filesystem   running  [Stop]
+  ● git          running  [Stop]
+  ○ openclaw     stopped  [Start]
+  ○ github       stopped  [Start]  (needs GITHUB_TOKEN)
+  [+ Add Server]
+
+  Each server shows:
+  - Status indicator (green dot = running, grey = stopped, red = error)
+  - Tool count when running ("12 tools available")
+  - Restart button
+  - Log viewer (last 50 lines of server stderr)
+
+Tool surface exposure:
+  - The built-in QUERY mode AI call receives the full active tool list
+  - When the classifier routes to QUERY, the AI can call MCP tools
+    (e.g. "what's in my git log" → AI calls git MCP tool → answers with real data)
+  - Agents launched in agent tabs also receive the active MCP tool list
+    if the agent supports MCP tool injection via its config
+
+Per-project MCP config in .termconfig:
+  [mcp]
+  servers = ["filesystem", "git", "openclaw"]
+  auto_start = true
+
+Deliverables:
+  - filesystem MCP server starts automatically and works
+  - git MCP server starts automatically and works
+  - Custom SSE server can be added and connected
+  - Server lifecycle panel shows correct status
+  - Crash recovery and auto-restart work
+  - A QUERY mode question that requires filesystem data ("how many js files
+    are in this project?") is answered using the filesystem MCP tool
+
+
+
+================================================================================
+PHASE 8 — POLISH, SETTINGS UI, AND OSS RELEASE
+================================================================================
+
+Goals:
+Complete the app to a shippable open-source quality standard.
+
+Settings UI (native macOS preferences window, tabbed):
+  General tab:
+    - Default shell path
+    - Default profile
+    - Startup behaviour (restore tabs, open new window, open default agent)
+    - Update check (manual only, no auto-update)
+    - Theme (app-level: follow system / always light / always dark)
+
+  Appearance tab:
+    - Theme browser with live preview
+    - Font picker
+    - Font size, line height, letter spacing
+    - Opacity / vibrancy slider
+    - Cursor style and blink
+    - Tab bar style
+    - Padding settings
+
+  Profiles tab:
+    - List of profiles with add/edit/delete
+    - Full profile editor form
+    - Import / export as JSON
+    - Set as default button
+
+  Providers tab:
+    - List of configured providers (name, endpoint, model count, status dot)
+    - Add / edit / delete provider
+    - Test Connection per provider
+    - Global default provider + model selector
+
+  Agents tab:
+    - List of known agents with detected/not-detected status
+    - Add custom agent
+    - Install hint with copy-to-clipboard for undetected agents
+
+  MCP Servers tab:
+    - List of configured servers with status
+    - Add server (stdio or SSE)
+    - Per-server log viewer
+    - Auto-start toggles
+
+  Keybindings tab:
+    - All app shortcuts listed and rebindable
+    - Reset to defaults button
+    - Defaults: Cmd+T new tab, Cmd+W close tab, Cmd+M model switcher,
+      Cmd+, preferences, Cmd+F find in scrollback, Cmd+K clear,
+      Cmd+D split pane (horizontal), Cmd+Shift+D split pane (vertical)
+
+Split panes:
+  - Cmd+D splits current tab horizontally (two panes side by side)
+  - Cmd+Shift+D splits vertically (two panes stacked)
+  - Each pane is an independent PTY session
+  - Panes are resizable by dragging the divider
+  - Max 4 panes per tab
+
+Find in scrollback:
+  - Cmd+F opens search bar at top of terminal
+  - Regex support
+  - Match count shown ("3 of 12")
+  - Next/previous match navigation
+  - Highlighted matches in scrollback
+
+Shell integration script:
+  - App offers to install a shell integration script into .zshrc on first launch
+  - Script provides: better OSC 7 (cwd reporting), command timing,
+    exit code reporting, prompt marking for semantic scrolling
+  - Semantic scrollback: Cmd+Up/Down jumps between command prompts
+
+Onboarding:
+  - First-launch wizard: 5 steps
+    1. Welcome + overview
+    2. Detect installed agents, show status, offer install hints
+    3. Add your first AI provider (pre-filled presets, paste key)
+    4. Choose a theme
+    5. Install shell integration (optional)
+
+macOS native integration:
+  - Proper app bundle with Info.plist, entitlements, correct UTI types
+  - Supports macOS 13 Ventura and later
+  - Universal binary (Apple Silicon + Intel)
+  - Proper sandboxing or hardened runtime (choose appropriately for PTY access)
+  - Dock icon, menu bar with full menu structure
+  - NSUserActivity for state restoration
+  - Spotlight support: "Open terminal here" for folders
+  - Finder extension (optional): right-click folder → Open in [AppName]
+  - Touch Bar support if running on older MacBook Pro (optional)
+  - Retina display: all assets @2x and @3x
+  - Dark mode and light mode tested for all UI elements
+
+Performance targets:
+  - App cold launch to usable terminal: under 1.5 seconds
+  - Input latency (keystroke to PTY echo): under 16ms
+  - Scrollback rendering: 60fps while scrolling 10,000 lines
+  - Model API first token latency: not the app's bottleneck — stream immediately
+
+OSS release preparation:
+  - README.md: project overview, screenshot, installation, quick start,
+    how to add a provider, how to add an agent, contributing guide
+  - LICENSE: MIT
+  - CONTRIBUTING.md: dev setup, build instructions, PR process
+  - .github/workflows/build.yml: GitHub Actions CI for macOS build + test
+  - Homebrew cask formula (homebrew-cask PR or personal tap)
+  - DMG installer generated by build pipeline
+  - CHANGELOG.md with v0.1.0 entry
+  - Issue templates: bug report, feature request
+  - Code of conduct
+
+Deliverables:
+  - Full settings UI working across all tabs
+  - Split panes working
+  - Find in scrollback working
+  - First-launch onboarding wizard
+  - Shell integration script installs and works
+  - Universal binary builds cleanly on GitHub Actions
+  - README, LICENSE, CONTRIBUTING in repo
+  - DMG installer produced by CI
+
+
+
+================================================================================
+APPENDIX A — FILE / FOLDER STRUCTURE (suggested)
+================================================================================
+
+[AppName]/
+├── [AppName].xcodeproj          (if Swift/Xcode)
+│   └── ...
+├── Sources/
+│   ├── App/
+│   │   ├── AppDelegate.swift
+│   │   ├── WindowController.swift
+│   │   └── ContentView.swift
+│   ├── Terminal/
+│   │   ├── PTYSession.swift
+│   │   ├── TerminalView.swift
+│   │   └── ShellIntegration.swift
+│   ├── AI/
+│   │   ├── InputClassifier.swift
+│   │   ├── ProviderRouter.swift
+│   │   ├── ModelProvider.swift
+│   │   └── Adapters/
+│   │       ├── AnthropicAdapter.swift
+│   │       ├── OpenAIAdapter.swift
+│   │       └── GeminiAdapter.swift
+│   ├── Agents/
+│   │   ├── AgentRegistry.swift
+│   │   ├── AgentSession.swift
+│   │   └── BuiltinAgents.swift
+│   ├── MCP/
+│   │   ├── MCPHost.swift
+│   │   ├── MCPServer.swift
+│   │   ├── StdioTransport.swift
+│   │   └── SSETransport.swift
+│   ├── Config/
+│   │   ├── Profile.swift
+│   │   ├── TermConfig.swift       (.termconfig parser)
+│   │   └── KeychainStore.swift
+│   ├── Themes/
+│   │   ├── ThemeParser.swift      (.itermcolors XML parser)
+│   │   ├── BuiltinThemes.swift
+│   │   └── ThemeBrowser.swift
+│   └── Settings/
+│       ├── SettingsWindow.swift
+│       └── tabs/
+│           ├── GeneralSettings.swift
+│           ├── AppearanceSettings.swift
+│           ├── ProfilesSettings.swift
+│           ├── ProvidersSettings.swift
+│           ├── AgentsSettings.swift
+│           ├── MCPSettings.swift
+│           └── KeybindingsSettings.swift
+├── Resources/
+│   ├── themes/                    (bundled .itermcolors files)
+│   └── shell-integration.zsh
+├── Tests/
+│   ├── ClassifierTests.swift
+│   ├── ThemeParserTests.swift
+│   └── ProviderAdapterTests.swift
+├── README.md
+├── LICENSE
+├── CONTRIBUTING.md
+├── CHANGELOG.md
+└── .github/
+    └── workflows/
+        └── build.yml
+
+
+
+================================================================================
+APPENDIX B — .TERMCONFIG FULL SCHEMA
+================================================================================
+
+# .termconfig — place in project root, gitignore or check in as preferred
+# All fields optional. Unset fields fall back to user's profile/global defaults.
+
+[profile]
+name = "work"                     # use this named profile for this project
+
+[ai]
+provider = "anthropic"            # provider id from providers config
+model = "claude-sonnet-4-5"       # model id
+classifier_model = "claude-haiku-4-5"  # model used for input classification
+
+[agents]
+default = "claude-code"           # agent to open by default for this project
+auto_start = false                # open default agent tab when project opens
+
+[mcp]
+servers = ["filesystem", "git"]   # MCP servers to activate for this project
+auto_start = true
+
+
+
+================================================================================
+APPENDIX C — PROVIDER NORMALISATION REFERENCE
+================================================================================
+
+OpenAI-compatible (used for: OpenAI, Groq, Together, Mistral, Kimi, DeepSeek,
+                              Ollama, llama.cpp, OpenRouter, OpenClaw, most others):
+  POST {endpoint}
+  Authorization: Bearer {key}
+  Content-Type: application/json
+  { "model": "{model_id}", "messages": [...], "stream": true }
+
+Anthropic (requires thin adapter):
+  POST https://api.anthropic.com/v1/messages
+  x-api-key: {key}
+  anthropic-version: 2023-06-01
+  Content-Type: application/json
+  { "model": "{model_id}", "max_tokens": 4096, "messages": [...], "stream": true }
+  Note: messages array same structure, but "role" is "user"/"assistant" only,
+        no "system" role in messages — system goes in top-level "system" field
+
+Gemini (requires full adapter):
+  POST https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent
+  ?key={api_key}
+  { "contents": [ { "role": "user", "parts": [{"text": "..."}] } ] }
+  Response format is different — adapter maps to standard delta chunks
+
+
+
+================================================================================
+END OF BUILD PROMPT
+================================================================================
+
+Version : 1.0
+Platform: macOS (native, Apple Silicon + Intel universal binary)
+License : MIT (apply to all generated code)
+Repo    : https://github.com/[your-username]/[app-name]
