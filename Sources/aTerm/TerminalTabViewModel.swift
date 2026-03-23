@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -21,6 +22,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     let id: UUID
     let kind: TabKind
 
+    let terminalBuffer: TerminalBuffer
     @Published private(set) var displayText = ""
     @Published private(set) var statusText = "starting shell..."
     @Published private(set) var title: String
@@ -40,6 +42,8 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     @Published var isRegexSearchEnabled = false
     @Published private(set) var searchMatchCount = 0
     @Published private(set) var currentSearchIndex = 0
+    /// Incremented on every buffer update to trigger SwiftUI redraw
+    @Published private(set) var bufferVersion: UInt64 = 0
 
     private(set) var profileID: UUID?
     private(set) var profileName: String
@@ -50,7 +54,10 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     private var currentRows: UInt16 = 30
     private var session: PTYSession?
     private var outputTask: Task<Void, Never>?
-    private let decoder = TerminalStreamDecoder()
+    private var autoRestartTask: Task<Void, Never>?
+    private var searchUpdateTask: Task<Void, Never>?
+    private lazy var vt100Parser: VT100Parser = VT100Parser(buffer: terminalBuffer)
+    let conversationHistory = ConversationHistory()
     private var recentCommands: [String] = []
     private var lastOutputSnippet = ""
     private let explicitLaunchConfiguration: PTYLaunchConfiguration?
@@ -64,6 +71,8 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         launchConfiguration: PTYLaunchConfiguration? = nil
     ) {
         self.id = id
+        terminalBuffer = TerminalBuffer(columns: Int(currentColumns), rows: Int(currentRows))
+        terminalBuffer.scrollbackLimit = profile.appearance.scrollbackSize
         title = initialTitle
         currentWorkingDirectory = workingDirectory
         preferredWorkingDirectory = workingDirectory
@@ -111,7 +120,6 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             return
         }
 
-        displayText.append("\n")
         restartSessionIfPossible()
     }
 
@@ -119,10 +127,14 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         guard columns > 0, rows > 0 else { return }
         currentColumns = columns
         currentRows = rows
+        terminalBuffer.resize(columns: Int(columns), rows: Int(rows))
         session?.resize(columns: columns, rows: rows)
+        bufferVersion &+= 1
     }
 
     func terminate() {
+        autoRestartTask?.cancel()
+        autoRestartTask = nil
         outputTask?.cancel()
         outputTask = nil
         session?.terminate()
@@ -167,12 +179,15 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     func clearScrollback() {
+        terminalBuffer.eraseInDisplay(3)
         displayText = ""
         lastOutputSnippet = ""
+        bufferVersion &+= 1
         refreshSearch()
     }
 
     func refreshSearch() {
+        displayText = terminalBuffer.plainText()
         searchResult = Self.computeSearchResult(
             text: displayText,
             query: searchQuery,
@@ -180,6 +195,15 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         )
         searchMatchCount = searchResult.matches.count
         currentSearchIndex = min(currentSearchIndex, max(searchMatchCount - 1, 0))
+    }
+
+    private func scheduleSearchUpdate() {
+        searchUpdateTask?.cancel()
+        searchUpdateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms debounce
+            guard !Task.isCancelled else { return }
+            self?.refreshSearch()
+        }
     }
 
     func nextSearchMatch() {
@@ -215,8 +239,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
 
     private func startSession() {
         outputTask?.cancel()
-        decoder.reset()
-        displayText = ""
+        vt100Parser.reset()
 
         do {
             let configuration = try sessionConfiguration()
@@ -234,21 +257,37 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
                 for await event in session.events {
                     switch event {
                     case let .output(data):
-                        let chunk = self.decoder.consume(data)
-                        if !chunk.displayText.isEmpty {
-                            self.appendToScrollback(chunk.displayText)
-                            self.lastOutputSnippet = String(chunk.displayText.suffix(120))
+                        self.vt100Parser.feed(data)
+                        // Sync mode flags
+                        TerminalKeyMapper.applicationCursorKeys = self.terminalBuffer.applicationCursorKeys
+                        // Handle bell
+                        if self.terminalBuffer.bellFired {
+                            self.terminalBuffer.bellFired = false
+                            NSApplication.shared.requestUserAttention(.informationalRequest)
                         }
-                        if let workingDirectory = chunk.workingDirectory {
-                            self.currentWorkingDirectory = workingDirectory
-                            self.preferredWorkingDirectory = workingDirectory
-                            if !self.isAgentTab {
-                                self.title = workingDirectory.lastPathComponent.isEmpty ? "/" : workingDirectory.lastPathComponent
+                        // Capture a short snippet for AI context (cheap)
+                        self.lastOutputSnippet = self.terminalBuffer.lastScreenLine(maxChars: 120)
+                        // Trigger view redraw without recreating the view
+                        self.bufferVersion &+= 1
+                        // Lazily update displayText for search only when search is active
+                        if self.isSearchPresented { self.scheduleSearchUpdate() }
+
+                        // Check buffer for title/cwd changes
+                        if let workingDirectory = self.terminalBuffer.workingDirectory {
+                            if workingDirectory != self.currentWorkingDirectory {
+                                self.currentWorkingDirectory = workingDirectory
+                                self.preferredWorkingDirectory = workingDirectory
+                                if !self.isAgentTab {
+                                    self.title = workingDirectory.lastPathComponent.isEmpty ? "/" : workingDirectory.lastPathComponent
+                                }
+                                self.stateDidChange?()
                             }
-                            self.stateDidChange?()
-                        } else if let title = chunk.title, !title.isEmpty, !self.isAgentTab {
-                            self.title = title
-                            self.stateDidChange?()
+                        }
+                        if let title = self.terminalBuffer.title, !title.isEmpty, !self.isAgentTab {
+                            if title != self.title {
+                                self.title = title
+                                self.stateDidChange?()
+                            }
                         }
                     case let .exit(status):
                         self.handleExit(status: status)
@@ -263,17 +302,24 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
 
     private func handleExit(status: Int32) {
         statusText = "session ended (\(status))"
-        displayText = Self.trimmedScrollback(
-            from: displayText + "\n[session ended — press any key to restart]",
-            limit: appearance.scrollbackSize
-        )
+        // Write exit message into the buffer
+        let exitMsg = "\r\n[session ended — press any key to restart]"
+        for ch in exitMsg {
+            if ch == "\r" { terminalBuffer.carriageReturn() }
+            else if ch == "\n" { terminalBuffer.lineFeed() }
+            else { terminalBuffer.putChar(ch) }
+        }
+        displayText = terminalBuffer.plainText()
         lastOutputSnippet = String(displayText.suffix(120))
+        bufferVersion &+= 1
 
         if case let .agent(agent) = kind {
             agentExitBanner = "[\(agent.name) exited with code \(status) — Restart?]"
             if status != 0, isAgentAutoRestartEnabled {
-                Task { @MainActor [weak self] in
+                autoRestartTask?.cancel()
+                autoRestartTask = Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard !Task.isCancelled else { return }
                     self?.restartSessionIfPossible()
                 }
             }
@@ -290,17 +336,6 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     private func refreshProviderLabel() {
         activeProviderName = appearance.aiProvider ?? "No provider"
         activeModelName = appearance.aiModel ?? "No model"
-    }
-
-    private func appendToScrollback(_ text: String) {
-        displayText = Self.trimmedScrollback(from: displayText + text, limit: appearance.scrollbackSize)
-        refreshSearch()
-    }
-
-    private static func trimmedScrollback(from text: String, limit: Int) -> String {
-        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
-        guard lines.count > limit else { return text }
-        return lines.suffix(limit).joined(separator: "\n")
     }
 
     private static func computeSearchResult(text: String, query: String, isRegex: Bool) -> SearchResult {
@@ -343,6 +378,7 @@ final class TerminalTabViewModel: ObservableObject, Identifiable {
     @Published private(set) var panes: [TerminalPaneViewModel]
     @Published var activePaneID: UUID
     @Published var splitOrientation: PaneSplitOrientation?
+    @Published var hasUnreadOutput = false
 
     var stateDidChange: (() -> Void)?
 

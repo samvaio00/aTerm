@@ -52,14 +52,20 @@ struct PTYLaunchConfiguration {
     }
 }
 
-final class PTYSession {
+final class PTYSession: @unchecked Sendable {
     let events: AsyncStream<PTYEvent>
     let executablePath: String
     let displayName: String
     let workingDirectory: URL?
 
-    private var continuation: AsyncStream<PTYEvent>.Continuation?
-    private(set) var isRunning = false
+    private let lock = NSLock()
+    private var _continuation: AsyncStream<PTYEvent>.Continuation?
+    private var _isRunning = false
+
+    private(set) var isRunning: Bool {
+        get { lock.withLock { _isRunning } }
+        set { lock.withLock { _isRunning = newValue } }
+    }
 
     private var masterFileDescriptor: Int32 = -1
     private var childProcessID: pid_t = 0
@@ -76,19 +82,19 @@ final class PTYSession {
         events = AsyncStream { continuation in
             streamContinuation = continuation
         }
-        self.continuation = streamContinuation
+        self._continuation = streamContinuation
 
         try spawn(columns: columns, rows: rows)
     }
 
     deinit {
         terminate()
-        continuation?.finish()
+        lock.withLock { _continuation?.finish() }
     }
 
     func start() {
         guard masterFileDescriptor >= 0 else { return }
-        isRunning = true
+        lock.withLock { _isRunning = true }
 
         let queue = DispatchQueue(label: "com.aterm.pty.read", qos: .userInitiated)
         let source = DispatchSource.makeReadSource(fileDescriptor: masterFileDescriptor, queue: queue)
@@ -124,12 +130,24 @@ final class PTYSession {
     }
 
     func terminate() {
-        guard childProcessID > 0 else { return }
-        kill(childProcessID, SIGTERM)
+        let pid = childProcessID
+        guard pid > 0 else { return }
+        kill(pid, SIGTERM)
+
+        // SIGKILL after 3 seconds if still alive
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
+            var status: Int32 = 0
+            let result = waitpid(pid, &status, WNOHANG)
+            if result == 0 {
+                // Process still running — force kill
+                kill(pid, SIGKILL)
+            }
+        }
+
         readSource?.cancel()
         readSource = nil
         childProcessID = 0
-        isRunning = false
+        lock.withLock { _isRunning = false }
     }
 
     private func spawn(columns: UInt16, rows: UInt16) throws {
@@ -158,7 +176,7 @@ final class PTYSession {
         let bytesRead = read(masterFileDescriptor, &buffer, buffer.count)
 
         if bytesRead > 0 {
-            continuation?.yield(.output(Data(buffer.prefix(bytesRead))))
+            lock.withLock { _ = _continuation?.yield(.output(Data(buffer.prefix(bytesRead)))) }
             return
         }
 
@@ -187,11 +205,15 @@ final class PTYSession {
     }
 
     private func finish(exitStatus: Int32) {
-        guard isRunning else { return }
-        isRunning = false
+        let shouldFinish: Bool = lock.withLock {
+            guard _isRunning else { return false }
+            _isRunning = false
+            return true
+        }
+        guard shouldFinish else { return }
         readSource?.cancel()
         readSource = nil
-        continuation?.yield(.exit(exitStatus))
+        lock.withLock { _ = _continuation?.yield(.exit(exitStatus)) }
     }
 }
 

@@ -44,13 +44,16 @@ struct ProviderRouter {
 
     func streamResponse(provider: ModelProvider, modelID: String, messages: [ChatMessage]) throws -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     let request = try makeStreamingRequest(provider: provider, modelID: modelID, messages: messages)
                     let (bytes, _) = try await URLSession.shared.bytes(for: request)
-                    var buffer = ""
 
                     for try await line in bytes.lines {
+                        if Task.isCancelled {
+                            continuation.finish()
+                            return
+                        }
                         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard trimmed.hasPrefix("data:") else { continue }
                         let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
@@ -59,8 +62,7 @@ struct ProviderRouter {
                             return
                         }
 
-                        buffer = String(payload)
-                        if let chunk = parseStreamingChunk(buffer, provider: provider) {
+                        if let chunk = parseStreamingChunk(String(payload), provider: provider) {
                             continuation.yield(chunk)
                         }
                     }
@@ -69,6 +71,9 @@ struct ProviderRouter {
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
             }
         }
     }
@@ -131,26 +136,34 @@ struct ProviderRouter {
         }
     }
 
-    private func makeRequestBody(provider: ModelProvider, modelID: String, messages: [ChatMessage], stream: Bool) throws -> Data {
+    private func makeRequestBody(provider: ModelProvider, modelID: String, messages: [ChatMessage], stream: Bool, tools: [ToolSchema]? = nil) throws -> Data {
         switch provider.apiFormat {
         case .openAICompatible, .custom:
-            return try JSONSerialization.data(withJSONObject: [
+            var body: [String: Any] = [
                 "model": modelID,
                 "messages": messages.map { ["role": $0.role, "content": $0.content] },
                 "stream": stream,
-            ])
+            ]
+            if let tools, !tools.isEmpty {
+                body["tools"] = tools.map { $0.toOpenAIFormat() }
+            }
+            return try JSONSerialization.data(withJSONObject: body)
         case .anthropic:
             let system = messages.first(where: { $0.role == "system" })?.content
             let anthropicMessages = messages
                 .filter { $0.role != "system" }
                 .map { ["role": $0.role == "assistant" ? "assistant" : "user", "content": $0.content] }
-            return try JSONSerialization.data(withJSONObject: [
+            var body: [String: Any] = [
                 "model": modelID,
-                "max_tokens": 256,
+                "max_tokens": 4096,
                 "stream": stream,
                 "system": system as Any,
                 "messages": anthropicMessages,
-            ])
+            ]
+            if let tools, !tools.isEmpty {
+                body["tools"] = tools.map { $0.toAnthropicFormat() }
+            }
+            return try JSONSerialization.data(withJSONObject: body)
         case .gemini:
             let prompt = messages.map(\.content).joined(separator: "\n\n")
             return try JSONSerialization.data(withJSONObject: [

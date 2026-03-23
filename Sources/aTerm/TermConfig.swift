@@ -6,6 +6,8 @@ struct TermConfig {
     var aiModel: String?
     var classifierModel: String?
     var mcpServers: [String] = []
+    var defaultAgent: String?
+    var agentAutoStart: Bool = false
 
     static func load(from directory: URL) -> TermConfig? {
         let url = directory.appendingPathComponent(".termconfig")
@@ -48,6 +50,10 @@ struct TermConfig {
                     .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
                     .split(separator: ",")
                     .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \"")) }
+            case ("agents", "default"):
+                config.defaultAgent = value
+            case ("agents", "auto_start"):
+                config.agentAutoStart = value.lowercased() == "true"
             default:
                 break
             }

@@ -61,6 +61,11 @@ private struct TabButton: View {
                         Text(tab.title)
                             .font(.system(size: 12, weight: .semibold))
                             .lineLimit(1)
+                        if tab.hasUnreadOutput && !isSelected {
+                            Circle()
+                                .fill(Color.blue)
+                                .frame(width: 6, height: 6)
+                        }
                     }
                     Text(tab.currentWorkingDirectory?.path ?? tab.statusText)
                         .font(.system(size: 10, weight: .medium, design: .monospaced))

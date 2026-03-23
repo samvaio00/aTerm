@@ -20,6 +20,7 @@ final class AppModel: ObservableObject {
     @Published var mcpServers: [MCPServerDefinition] = []
     @Published var mcpSnapshots: [String: MCPServerSnapshot] = [:]
     @Published var isOnboardingPresented = false
+    @Published var isCommandPalettePresented = false
     @Published var shellIntegrationMessage: String?
 
     private let sessionStore = SessionStore()
@@ -61,6 +62,7 @@ final class AppModel: ObservableObject {
         }
 
         autoStartGlobalMCPServers()
+        Task { await detectOllamaModels() }
     }
 
     var selectedTab: TerminalTabViewModel? {
@@ -214,7 +216,9 @@ final class AppModel: ObservableObject {
 
     func selectTab(id: UUID) {
         selectedTabID = id
-        tabs.first(where: { $0.id == id })?.startIfNeeded()
+        let tab = tabs.first(where: { $0.id == id })
+        tab?.hasUnreadOutput = false
+        tab?.startIfNeeded()
     }
 
     func moveTab(draggedID: UUID, targetID: UUID) {
@@ -345,64 +349,6 @@ final class AppModel: ObservableObject {
         target.markStateChanged()
     }
 
-    func submitInput(for tab: TerminalTabViewModel) {
-        if tab.isAgentTab {
-            let command = tab.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !command.isEmpty else { return }
-            tab.inputText = ""
-            tab.sendTerminalCommand(command)
-            return
-        }
-
-        let rawInput = tab.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawInput.isEmpty else { return }
-        let displayInput = inputClassifier.strippedOverrideInput(rawInput)
-        tab.inputText = ""
-
-        Task { @MainActor in
-            let provider = self.provider(for: tab.appearance.aiProvider)
-            let classifierModelID = tab.appearance.classifierModel ?? tab.appearance.aiModel
-
-            do {
-                let classification = try await inputClassifier.classify(
-                    rawInput,
-                    context: tab.terminalContext(),
-                    provider: provider,
-                    modelID: classifierModelID
-                )
-
-                guard let classification else {
-                    tab.submissionState = .waitingForDisambiguation(displayInput)
-                    tab.modeIndicatorText = "AMBIGUOUS"
-                    return
-                }
-
-                switch classification {
-                case .terminal:
-                    tab.clearAssistantState()
-                    tab.sendTerminalCommand(displayInput)
-                case .aiToShell:
-                    tab.queryResponse = QueryResponseState()
-                    tab.submissionState = .idle
-                    tab.modeIndicatorText = InputMode.aiToShell.rawValue
-                    await generateShellCommand(from: displayInput, for: tab)
-                case .query:
-                    tab.aiShellState = AIShellState()
-                    tab.submissionState = .idle
-                    tab.modeIndicatorText = InputMode.query.rawValue
-                    await answerQuery(displayInput, for: tab)
-                }
-            } catch {
-                tab.queryResponse = QueryResponseState(
-                    text: "Classification failed: \(error.localizedDescription)",
-                    isStreaming: false,
-                    suggestions: []
-                )
-                tab.modeIndicatorText = "ERROR"
-            }
-        }
-    }
-
     func submitInput(for pane: TerminalPaneViewModel) {
         if pane.isAgentTab {
             let command = pane.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -461,26 +407,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func resolveDisambiguation(as mode: InputMode, for tab: TerminalTabViewModel) {
-        guard case let .waitingForDisambiguation(input) = tab.submissionState else { return }
-        tab.submissionState = .idle
-        switch mode {
-        case .terminal:
-            tab.clearAssistantState()
-            tab.sendTerminalCommand(input)
-        case .aiToShell:
-            tab.modeIndicatorText = InputMode.aiToShell.rawValue
-            Task { @MainActor in
-                await generateShellCommand(from: input, for: tab)
-            }
-        case .query:
-            tab.modeIndicatorText = InputMode.query.rawValue
-            Task { @MainActor in
-                await answerQuery(input, for: tab)
-            }
-        }
-    }
-
     func resolveDisambiguation(as mode: InputMode, for pane: TerminalPaneViewModel) {
         guard case let .waitingForDisambiguation(input) = pane.submissionState else { return }
         pane.submissionState = .idle
@@ -501,22 +427,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func runGeneratedCommand(for tab: TerminalTabViewModel) {
-        let command = tab.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !command.isEmpty else { return }
-        tab.aiShellState = AIShellState()
-        tab.sendTerminalCommand(command)
-    }
-
     func runGeneratedCommand(for pane: TerminalPaneViewModel) {
         let command = pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !command.isEmpty else { return }
         pane.aiShellState = AIShellState()
         pane.sendTerminalCommand(command)
-    }
-
-    func runQuerySuggestion(_ suggestion: QueryCommandSuggestion, for tab: TerminalTabViewModel) {
-        tab.sendTerminalCommand(suggestion.command)
     }
 
     func runQuerySuggestion(_ suggestion: QueryCommandSuggestion, for pane: TerminalPaneViewModel) {
@@ -660,6 +575,53 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func detectOllamaModels() async {
+        guard let ollamaProvider = providers.first(where: { $0.id == "ollama" }) else { return }
+
+        // Probe Ollama API for running models
+        guard let url = URL(string: "http://localhost:11434/api/tags") else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else { return }
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = json["models"] as? [[String: Any]] else { return }
+
+            let detected = models.compactMap { model -> ModelDefinition? in
+                guard let name = model["name"] as? String else { return nil }
+                let size = model["size"] as? Int ?? 0
+                let sizeGB = String(format: "%.1fGB", Double(size) / 1_073_741_824)
+                return ModelDefinition(
+                    id: name,
+                    name: "\(name) (\(sizeGB))",
+                    contextWindow: 128_000,
+                    supportsStreaming: true
+                )
+            }
+
+            guard !detected.isEmpty else { return }
+
+            // Merge detected models with existing Ollama provider
+            var updated = ollamaProvider
+            let existingIDs = Set(updated.models.map(\.id))
+            for model in detected where !existingIDs.contains(model.id) {
+                updated.models.append(model)
+            }
+
+            // Update provider if new models found
+            if updated.models.count != ollamaProvider.models.count {
+                providers.removeAll(where: { $0.id == "ollama" })
+                providers.append(updated)
+                persistProviders()
+                tabs.forEach(refreshProviderLabel(for:))
+            }
+        } catch {
+            // Ollama not running — that's fine, skip silently
+        }
+    }
+
     private func restoreTabs() {
         let storedTabs = sessionStore.loadTabs()
         tabs = storedTabs.compactMap { descriptor in
@@ -705,6 +667,10 @@ final class AppModel: ObservableObject {
         tab.stateDidChange = { [weak self, weak tab] in
             Task { @MainActor [weak self, weak tab] in
                 guard let self, let tab else { return }
+                // Mark unread if this tab is not selected
+                if self.selectedTabID != tab.id {
+                    tab.hasUnreadOutput = true
+                }
                 self.persistTabs()
                 self.applyProjectConfigIfNeeded(to: tab, directory: tab.currentWorkingDirectory)
                 self.refreshProviderLabel(for: tab)
@@ -721,8 +687,14 @@ final class AppModel: ObservableObject {
         tab.panes.forEach(refreshProviderLabel(for:))
     }
 
+    private var lastAppliedConfigDirectories: [UUID: URL] = [:]
+
     private func applyProjectConfigIfNeeded(to tab: TerminalTabViewModel, directory: URL?) {
         guard let directory, let config = TermConfig.load(from: directory) else { return }
+
+        // Don't re-apply if we already applied config for this directory
+        if lastAppliedConfigDirectories[tab.id] == directory { return }
+        lastAppliedConfigDirectories[tab.id] = directory
 
         if let profileName = config.profileName,
            let profile = profiles.first(where: { $0.name.caseInsensitiveCompare(profileName) == .orderedSame }) {
@@ -747,6 +719,20 @@ final class AppModel: ObservableObject {
             for serverID in config.mcpServers {
                 if let definition = mcpServers.first(where: { $0.id == serverID }) {
                     startMCPServer(definition, cwd: directory)
+                }
+        }
+        }
+
+        // Auto-start default agent if configured
+        if let agentID = config.defaultAgent, config.agentAutoStart {
+            if let agentDef = agent(for: agentID) {
+                // Only launch if no agent tab already open for this project
+                let hasAgentTab = tabs.contains { tab in
+                    if case .agent(let def) = tab.kind, def.id == agentID { return true }
+                    return false
+                }
+                if !hasAgentTab {
+                    launchAgent(agentDef, from: tab)
                 }
             }
         }
@@ -866,46 +852,6 @@ final class AppModel: ObservableObject {
         pane.setProviderLabel(providerName: provider?.name ?? pane.appearance.aiProvider, modelName: modelName)
     }
 
-    private func generateShellCommand(from input: String, for tab: TerminalTabViewModel) async {
-        tab.aiShellState = AIShellState(originalPrompt: input, generatedCommand: "", isGenerating: true, isEditing: false)
-
-        guard let provider = provider(for: tab.appearance.aiProvider),
-              let modelID = tab.appearance.aiModel else {
-            tab.aiShellState = AIShellState(
-                originalPrompt: input,
-                generatedCommand: "No provider or model configured.",
-                isGenerating: false,
-                isEditing: true
-            )
-            return
-        }
-
-        do {
-            let command = try await providerRouter.complete(
-                provider: provider,
-                modelID: modelID,
-                messages: [
-                    ChatMessage(role: "system", content: "Convert the request into a single shell command for zsh. Reply with only the command, no markdown, no explanation."),
-                    ChatMessage(role: "user", content: "cwd=\(tab.currentWorkingDirectory?.path ?? "")\nrequest=\(input)")
-                ]
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
-
-            tab.aiShellState = AIShellState(
-                originalPrompt: input,
-                generatedCommand: command,
-                isGenerating: false,
-                isEditing: false
-            )
-        } catch {
-            tab.aiShellState = AIShellState(
-                originalPrompt: input,
-                generatedCommand: "Generation failed: \(error.localizedDescription)",
-                isGenerating: false,
-                isEditing: true
-            )
-        }
-    }
-
     private func generateShellCommand(from input: String, for pane: TerminalPaneViewModel) async {
         pane.aiShellState = AIShellState(originalPrompt: input, generatedCommand: "", isGenerating: true, isEditing: false)
 
@@ -946,50 +892,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func answerQuery(_ input: String, for tab: TerminalTabViewModel) async {
-        tab.queryResponse = QueryResponseState(text: "", isStreaming: true, suggestions: [])
-
-        if let mcpAnswer = mcpHost.localFilesystemAnswer(question: input, cwd: tab.currentWorkingDirectory) {
-            tab.queryResponse = QueryResponseState(text: mcpAnswer, isStreaming: false, suggestions: [])
-            return
-        }
-
-        guard let provider = provider(for: tab.appearance.aiProvider),
-              let modelID = tab.appearance.aiModel else {
-            tab.queryResponse = QueryResponseState(text: "No provider or model configured for query mode.", isStreaming: false, suggestions: [])
-            return
-        }
-
-        do {
-            let toolSummary = mcpHost.toolList().map(\.id).joined(separator: ", ")
-            let stream = try providerRouter.streamResponse(
-                provider: provider,
-                modelID: modelID,
-                messages: [
-                    ChatMessage(role: "system", content: "You answer terminal questions concisely. If a shell command would help, include it in a fenced ```bash block. Active MCP tools: \(toolSummary)."),
-                    ChatMessage(role: "user", content: "cwd=\(tab.currentWorkingDirectory?.path ?? "")\nlast_commands=\(tab.terminalContext().lastCommands.joined(separator: " | "))\nlast_output=\(tab.terminalContext().lastOutputSnippet)\n\nQuestion:\n\(input)")
-                ]
-            )
-
-            for try await chunk in stream {
-                tab.queryResponse.text.append(chunk)
-            }
-            tab.queryResponse.isStreaming = false
-            tab.queryResponse.suggestions = extractSuggestions(from: tab.queryResponse.text)
-        } catch {
-            tab.queryResponse = QueryResponseState(
-                text: "Query failed: \(error.localizedDescription)",
-                isStreaming: false,
-                suggestions: []
-            )
-        }
-    }
-
     private func answerQuery(_ input: String, for pane: TerminalPaneViewModel) async {
         pane.queryResponse = QueryResponseState(text: "", isStreaming: true, suggestions: [])
 
+        // Try local MCP answer first
         if let mcpAnswer = mcpHost.localFilesystemAnswer(question: input, cwd: pane.currentWorkingDirectory) {
             pane.queryResponse = QueryResponseState(text: mcpAnswer, isStreaming: false, suggestions: [])
+            pane.conversationHistory.addUserMessage(input)
+            pane.conversationHistory.addAssistantMessage(mcpAnswer)
             return
         }
 
@@ -1000,27 +910,63 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            let toolSummary = mcpHost.toolList().map(\.id).joined(separator: ", ")
+            // Build system message with context
+            let toolDescriptions = mcpHost.toolList().map { "- \($0.name) (\($0.serverID))" }.joined(separator: "\n")
+            let systemPrompt = """
+            You answer terminal questions concisely. If a shell command would help, include it in a fenced ```bash block.
+            Current directory: \(pane.currentWorkingDirectory?.path ?? "unknown")
+            Recent commands: \(pane.terminalContext().lastCommands.joined(separator: " | "))
+            \(toolDescriptions.isEmpty ? "" : "Available MCP tools:\n\(toolDescriptions)")
+            """
+
+            // Update conversation history
+            pane.conversationHistory.addSystemMessage(systemPrompt)
+            let userMsg = "Last output: \(pane.terminalContext().lastOutputSnippet)\n\nQuestion: \(input)"
+            pane.conversationHistory.addUserMessage(userMsg)
+
             let stream = try providerRouter.streamResponse(
                 provider: provider,
                 modelID: modelID,
-                messages: [
-                    ChatMessage(role: "system", content: "You answer terminal questions concisely. If a shell command would help, include it in a fenced ```bash block. Active MCP tools: \(toolSummary)."),
-                    ChatMessage(role: "user", content: "cwd=\(pane.currentWorkingDirectory?.path ?? "")\nlast_commands=\(pane.terminalContext().lastCommands.joined(separator: " | "))\nlast_output=\(pane.terminalContext().lastOutputSnippet)\n\nQuestion:\n\(input)")
-                ]
+                messages: pane.conversationHistory.messages
             )
 
             for try await chunk in stream {
                 pane.queryResponse.text.append(chunk)
             }
+
             pane.queryResponse.isStreaming = false
             pane.queryResponse.suggestions = extractSuggestions(from: pane.queryResponse.text)
+            pane.conversationHistory.addAssistantMessage(pane.queryResponse.text)
+
+            // Handle tool calls in the response (simple detection)
+            await handleToolCallsIfPresent(in: pane.queryResponse.text, for: pane, provider: provider, modelID: modelID)
         } catch {
             pane.queryResponse = QueryResponseState(
                 text: "Query failed: \(error.localizedDescription)",
                 isStreaming: false,
                 suggestions: []
             )
+        }
+    }
+
+    private func handleToolCallsIfPresent(in responseText: String, for pane: TerminalPaneViewModel, provider: ModelProvider, modelID: String) async {
+        // Check if the AI response mentions using an MCP tool (simple heuristic)
+        // In a full implementation, this would parse function_call/tool_use from the API response
+        // For now, detect patterns like "Let me use the X tool" or tool invocation syntax
+        let toolNames = mcpHost.toolList().map(\.name)
+        for toolName in toolNames {
+            if responseText.contains("calling \(toolName)") || responseText.contains("using \(toolName)") {
+                do {
+                    let result = try await mcpHost.callTool(name: toolName, arguments: [:])
+                    let toolMsg = "\n\n**Tool result (\(toolName)):**\n\(result)"
+                    pane.queryResponse.text.append(toolMsg)
+                    pane.queryResponse.suggestions = extractSuggestions(from: pane.queryResponse.text)
+                    pane.conversationHistory.addAssistantMessage(toolMsg)
+                } catch {
+                    pane.queryResponse.text.append("\n\nTool call failed: \(error.localizedDescription)")
+                }
+                break
+            }
         }
     }
 

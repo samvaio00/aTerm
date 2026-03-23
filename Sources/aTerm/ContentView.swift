@@ -40,6 +40,10 @@ struct ContentView: View {
                 ModelPickerOverlay()
             }
 
+            if appModel.isCommandPalettePresented {
+                CommandPaletteOverlay()
+            }
+
             if appModel.isAgentPickerPresented {
                 AgentPickerOverlay()
             }
@@ -94,7 +98,7 @@ private struct TerminalPane: View {
             Divider()
 
             TerminalView(
-                text: pane.displayText,
+                buffer: pane.terminalBuffer,
                 appearance: pane.appearance,
                 theme: appModel.theme(for: pane.appearance.themeID),
                 searchQuery: pane.searchQuery,
@@ -105,6 +109,8 @@ private struct TerminalPane: View {
                 onResize: pane.updateTerminalSize(columns:rows:),
                 onBecomeActive: onSelect
             )
+            // bufferVersion change triggers updateNSView via @Published
+            .onChange(of: pane.bufferVersion) { _ in }
             .background(Color(appModel.theme(for: pane.appearance.themeID).palette.background.nsColor))
 
             if pane.isSearchPresented {
@@ -591,6 +597,108 @@ private struct AgentPickerOverlay: View {
         .onTapGesture {
             appModel.closeAgentPicker()
         }
+    }
+}
+
+private struct CommandPaletteOverlay: View {
+    @EnvironmentObject private var appModel: AppModel
+    @State private var query = ""
+
+    private struct PaletteAction: Identifiable {
+        let id: String
+        let label: String
+        let icon: String
+        let action: () -> Void
+    }
+
+    private var actions: [PaletteAction] {
+        let all: [PaletteAction] = [
+            .init(id: "new-tab", label: "New Tab", icon: "plus.square") { appModel.createTabAndSelect(); dismiss() },
+            .init(id: "close-tab", label: "Close Tab", icon: "xmark.square") { appModel.closeSelectedTab(); dismiss() },
+            .init(id: "model-picker", label: "Switch Model", icon: "brain") { dismiss(); appModel.toggleModelPicker() },
+            .init(id: "agent-picker", label: "Launch Agent", icon: "bolt") { dismiss(); appModel.openAgentPicker() },
+            .init(id: "find", label: "Find in Scrollback", icon: "magnifyingglass") { appModel.toggleSearchBar(); dismiss() },
+            .init(id: "clear", label: "Clear Scrollback", icon: "trash") { appModel.clearSelectedScrollback(); dismiss() },
+            .init(id: "split-h", label: "Split Horizontally", icon: "rectangle.split.2x1") { appModel.splitSelectedPane(.horizontal); dismiss() },
+            .init(id: "split-v", label: "Split Vertically", icon: "rectangle.split.1x2") { appModel.splitSelectedPane(.vertical); dismiss() },
+            .init(id: "shell-integration", label: "Install Shell Integration", icon: "terminal") { appModel.installShellIntegration(); dismiss() },
+        ]
+        // Add theme switching actions
+        + appModel.allThemes.map { theme in
+            PaletteAction(id: "theme-\(theme.id)", label: "Theme: \(theme.name)", icon: "paintbrush") {
+                appModel.applyTheme(theme)
+                dismiss()
+            }
+        }
+        // Add agent launch actions
+        + appModel.availableAgents.filter { appModel.agentStatuses[$0.id]?.isInstalled == true }.map { agent in
+            PaletteAction(id: "agent-\(agent.id)", label: "Launch \(agent.name)", icon: "bolt.circle") {
+                appModel.launchAgent(agent)
+                dismiss()
+            }
+        }
+
+        if query.isEmpty { return all }
+        let q = query.lowercased()
+        return all.filter { $0.label.lowercased().contains(q) }
+    }
+
+    private func dismiss() {
+        appModel.isCommandPalettePresented = false
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.3).ignoresSafeArea()
+                .onTapGesture { dismiss() }
+
+            VStack(spacing: 0) {
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Type a command...", text: $query)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 15))
+                        .onSubmit {
+                            if let first = actions.first { first.action() }
+                        }
+                }
+                .padding(12)
+
+                Divider()
+
+                ScrollView {
+                    VStack(spacing: 2) {
+                        ForEach(actions) { action in
+                            Button {
+                                action.action()
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: action.icon)
+                                        .frame(width: 20)
+                                        .foregroundStyle(.secondary)
+                                    Text(action.label)
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .background(Color.primary.opacity(0.001)) // hit target
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(maxHeight: 320)
+            }
+            .frame(width: 480)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .shadow(color: .black.opacity(0.25), radius: 20, y: 8)
+            .padding(.top, 60)
+            .frame(maxHeight: .infinity, alignment: .top)
+        }
+        .onExitCommand { dismiss() }
     }
 }
 

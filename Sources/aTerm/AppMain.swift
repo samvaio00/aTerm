@@ -59,6 +59,11 @@ struct ATermApp: App {
                 }
                 .keyboardShortcut("D", modifiers: [.command, .shift])
                 .disabled(appModel.selectedTab == nil)
+
+                Button("Command Palette") {
+                    appModel.isCommandPalettePresented.toggle()
+                }
+                .keyboardShortcut("p", modifiers: .command)
             }
         }
     }
