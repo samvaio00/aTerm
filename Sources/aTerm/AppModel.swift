@@ -583,12 +583,12 @@ final class AppModel: ObservableObject {
                 return p
             }
             providers = builtins + customProviders
-            defaultProviderID = stored.defaultProviderID ?? BuiltinProviders.all.first?.id
-            defaultModelID = stored.defaultModelID ?? BuiltinProviders.all.first?.models.first?.id
+            defaultProviderID = stored.defaultProviderID ?? "ollama"
+            defaultModelID = stored.defaultModelID
         } else {
             providers = BuiltinProviders.all
-            defaultProviderID = BuiltinProviders.all.first?.id
-            defaultModelID = BuiltinProviders.all.first?.models.first?.id
+            defaultProviderID = "ollama"
+            defaultModelID = nil
         }
         persistProviders()
     }
@@ -663,6 +663,10 @@ final class AppModel: ObservableObject {
             if updated.models.count != ollamaProvider.models.count {
                 providers.removeAll(where: { $0.id == "ollama" })
                 providers.append(updated)
+                // Auto-select first Ollama model if none chosen yet
+                if defaultProviderID == "ollama" && defaultModelID == nil {
+                    defaultModelID = updated.models.first?.id
+                }
                 persistProviders()
                 tabs.forEach(refreshProviderLabel(for:))
             }

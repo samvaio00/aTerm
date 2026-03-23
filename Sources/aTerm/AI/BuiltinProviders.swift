@@ -2,6 +2,8 @@ import Foundation
 
 enum BuiltinProviders {
     static let all: [ModelProvider] = [
+        provider(id: "ollama", name: "Ollama (local)", endpoint: "http://localhost:11434/v1/chat/completions", authType: .none, apiFormat: .openAICompatible, models: []),
+        provider(id: "llamacpp", name: "llama.cpp (local)", endpoint: "http://localhost:8080/v1/chat/completions", authType: .none, apiFormat: .openAICompatible, models: []),
         provider(
             id: "anthropic",
             name: "Anthropic",
@@ -81,8 +83,6 @@ enum BuiltinProviders {
             .init(id: "kimi-k2.5", name: "Kimi K2.5", contextWindow: 256_000, supportsStreaming: true),
             .init(id: "moonshot-v1-128k", name: "Moonshot V1 128K", contextWindow: 128_000, supportsStreaming: true),
         ]),
-        provider(id: "ollama", name: "Ollama (local)", endpoint: "http://localhost:11434/v1/chat/completions", authType: .none, apiFormat: .openAICompatible, models: []),
-        provider(id: "llamacpp", name: "llama.cpp (local)", endpoint: "http://localhost:8080/v1/chat/completions", authType: .none, apiFormat: .openAICompatible, models: []),
     ]
 
     private static func provider(
