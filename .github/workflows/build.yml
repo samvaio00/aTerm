@@ -12,5 +12,81 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
-      - name: Build
-        run: swift build
+
+      - name: Build (arm64)
+        run: swift build -c release --arch arm64
+
+      - name: Build (x86_64)
+        run: swift build -c release --arch x86_64
+
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            .build/arm64-apple-macosx/release/aTerm \
+            .build/x86_64-apple-macosx/release/aTerm \
+            -output aTerm-universal
+
+      - name: Test
+        run: swift test
+
+      - name: Create app bundle
+        run: |
+          APP_DIR="aTerm.app/Contents/MacOS"
+          mkdir -p "$APP_DIR"
+          cp aTerm-universal "$APP_DIR/aTerm"
+          cp Info.plist aTerm.app/Contents/Info.plist
+
+          # Copy resources
+          RESOURCES_DIR="aTerm.app/Contents/Resources"
+          mkdir -p "$RESOURCES_DIR"
+          if [ -d Sources/aTerm/Resources ]; then
+            cp -R Sources/aTerm/Resources/* "$RESOURCES_DIR/" 2>/dev/null || true
+          fi
+          # Copy Swift package resource bundle if present
+          BUNDLE=$(find .build/release -name 'aTerm_aTerm.bundle' -maxdepth 1 2>/dev/null | head -1)
+
+      - name: Build Finder extension
+        run: |
+          # Compile the Finder extension (requires FinderSync framework)
+          EXT_DIR="aTerm.app/Contents/PlugIns/aTermFinderExtension.appex/Contents/MacOS"
+          mkdir -p "$EXT_DIR"
+          swiftc -target arm64-apple-macos13 \
+            -framework Cocoa -framework FinderSync \
+            -module-name aTermFinderExtension \
+            Sources/aTermFinderExtension/FinderSync.swift \
+            -o "$EXT_DIR/aTermFinderExtension" 2>/dev/null || echo "Finder extension build skipped (FinderSync requires Xcode)"
+          if [ -f "$EXT_DIR/aTermFinderExtension" ]; then
+            cp Sources/aTermFinderExtension/Info.plist "aTerm.app/Contents/PlugIns/aTermFinderExtension.appex/Contents/Info.plist"
+          fi
+          if [ -n "$BUNDLE" ]; then
+            cp -R "$BUNDLE" "$RESOURCES_DIR/"
+          fi
+
+      - name: Sign with entitlements (ad-hoc)
+        run: |
+          codesign --force --options runtime \
+            --entitlements aTerm.entitlements \
+            --sign - \
+            aTerm.app
+
+      - name: Create DMG
+        run: |
+          brew install create-dmg || true
+          create-dmg \
+            --volname "aTerm" \
+            --volicon "aTerm.app/Contents/Resources/AppIcon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "aTerm.app" 150 190 \
+            --app-drop-link 450 190 \
+            --no-internet-enable \
+            "aTerm-0.1.0.dmg" \
+            "aTerm.app" || \
+          hdiutil create -volname "aTerm" -srcfolder "aTerm.app" -ov -format UDZO "aTerm-0.1.0.dmg"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aTerm-dmg
+          path: aTerm-0.1.0.dmg

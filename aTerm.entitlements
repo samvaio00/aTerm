@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened Runtime -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+
+	<!-- Allow spawning child processes (PTY via forkpty) -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<false/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<false/>
+
+	<!-- Network client access for AI provider API calls -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- Keychain access for storing API credentials -->
+	<key>com.apple.security.keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.aterm.app</string>
+	</array>
+
+	<!-- Allow inherited file handles (needed for PTY/forkpty) -->
+	<key>com.apple.security.inherit</key>
+	<true/>
+
+	<!-- Allow DYLD environment variables (for shell integration) -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

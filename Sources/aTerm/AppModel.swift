@@ -29,7 +29,8 @@ final class AppModel: ObservableObject {
     private let providerStore = ProviderStore()
     private let agentStore = AgentStore()
     private let mcpStore = MCPStore()
-    private let providerRouter = ProviderRouter()
+    let oauthManager = OAuthManager()
+    private var providerRouter: ProviderRouter
     private let inputClassifier = InputClassifier()
     private let keychainStore = KeychainStore()
     private let agentDetector = AgentDetector()
@@ -41,28 +42,36 @@ final class AppModel: ObservableObject {
     private var previewBackupAppearance: TerminalAppearance?
 
     init() {
+        providerRouter = ProviderRouter()
+        providerRouter.oauthManager = oauthManager
+        Log.debug("app", "AppModel.init() start")
         importedThemes = themeStore.loadImportedThemes()
         restoreProfiles()
         restoreProviders()
         restoreAgents()
         restoreMCPServers()
-        scanAgents()
-        restoreTabs()
         showNerdFontBanner = !FontSupport.currentTerminalFontSupportsNerdGlyphs && !UserDefaults.standard.bool(forKey: nerdFontDismissalKey)
         isOnboardingPresented = !UserDefaults.standard.bool(forKey: onboardingDismissalKey)
 
-        if tabs.isEmpty {
-            createTabAndSelect()
-        } else {
-            tabs.forEach { tab in
-                applyProjectConfigIfNeeded(to: tab, directory: tab.currentWorkingDirectory)
-                refreshProviderLabel(for: tab)
-                tab.startIfNeeded()
+        // Defer heavy work — run agent scanning off main thread
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let definitions = await self.agentDefinitions
+            let detector = AgentDetector()
+            let statuses = detector.detect(definitions)
+            await MainActor.run {
+                self.agentStatuses = statuses
+                Log.debug("app", "Agent scan complete: \(statuses.count) agents")
             }
         }
-
-        autoStartGlobalMCPServers()
+        // MCP auto-start also deferred
+        Task { @MainActor [weak self] in
+            // Yield to let UI render first
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            self?.autoStartGlobalMCPServers()
+        }
         Task { await detectOllamaModels() }
+        Log.debug("app", "AppModel.init() done, onboarding=\(isOnboardingPresented)")
     }
 
     var selectedTab: TerminalTabViewModel? {
@@ -305,8 +314,18 @@ final class AppModel: ObservableObject {
     }
 
     func upsertProvider(_ provider: ModelProvider, secret: String?) throws {
-        providers.removeAll(where: { $0.id == provider.id })
-        providers.append(provider)
+        // For builtin providers, merge user changes (like OAuth client ID) into the existing entry
+        if let existingIndex = providers.firstIndex(where: { $0.id == provider.id }),
+           providers[existingIndex].isBuiltin {
+            var existing = providers[existingIndex]
+            if let newOAuth = provider.oauthConfig {
+                existing.oauthConfig = newOAuth
+            }
+            providers[existingIndex] = existing
+        } else {
+            providers.removeAll(where: { $0.id == provider.id })
+            providers.append(provider)
+        }
         if let secret, !secret.isEmpty {
             try keychainStore.save(secret: secret, account: provider.id)
         }
@@ -464,7 +483,23 @@ final class AppModel: ObservableObject {
     }
 
     func hasStoredCredential(for providerID: String) -> Bool {
-        (try? keychainStore.readSecret(account: providerID))??.isEmpty == false
+        // Check OAuth credentials first, then API key
+        if let provider = provider(for: providerID),
+           provider.authType == .oauthToken, provider.oauthConfig != nil {
+            return oauthManager.isSignedIn(providerID: providerID)
+        }
+        return keychainStore.hasSecret(account: providerID)
+    }
+
+    func signInWithOAuth(providerID: String) async throws {
+        guard let provider = provider(for: providerID) else { return }
+        try await oauthManager.signIn(provider: provider)
+        objectWillChange.send()
+    }
+
+    func signOutOAuth(providerID: String) throws {
+        try oauthManager.signOut(providerID: providerID)
+        objectWillChange.send()
     }
 
     func upsertAgent(_ agent: AgentDefinition) {
@@ -478,8 +513,10 @@ final class AppModel: ObservableObject {
     }
 
     func completeOnboarding() {
+        Log.debug("app", "completeOnboarding() called")
         isOnboardingPresented = false
         UserDefaults.standard.set(true, forKey: onboardingDismissalKey)
+        Log.debug("app", "completeOnboarding() done, isOnboardingPresented=\(isOnboardingPresented)")
     }
 
     func installShellIntegration() {
@@ -531,17 +568,29 @@ final class AppModel: ObservableObject {
     }
 
     private func restoreProviders() {
+        // Always use fresh builtin providers to get model updates
+        let builtinIDs = Set(BuiltinProviders.all.map { $0.id })
         if let stored = providerStore.load() {
-            let customProviders = stored.providers.filter { !$0.isBuiltin }
-            providers = BuiltinProviders.all + customProviders
+            // Keep custom providers that aren't builtins
+            let customProviders = stored.providers.filter { !builtinIDs.contains($0.id) }
+            // Merge saved OAuth client IDs back into builtin providers
+            let builtins = BuiltinProviders.all.map { p -> ModelProvider in
+                guard var p = Optional(p),
+                      let clientID = stored.oauthClientIDs[p.id],
+                      var oauth = p.oauthConfig else { return p }
+                oauth.clientID = clientID
+                p.oauthConfig = oauth
+                return p
+            }
+            providers = builtins + customProviders
             defaultProviderID = stored.defaultProviderID ?? BuiltinProviders.all.first?.id
             defaultModelID = stored.defaultModelID ?? BuiltinProviders.all.first?.models.first?.id
         } else {
             providers = BuiltinProviders.all
             defaultProviderID = BuiltinProviders.all.first?.id
             defaultModelID = BuiltinProviders.all.first?.models.first?.id
-            persistProviders()
         }
+        persistProviders()
     }
 
     private func restoreAgents() {
@@ -571,7 +620,7 @@ final class AppModel: ObservableObject {
 
     private func autoStartGlobalMCPServers() {
         for server in mcpServers where server.autoStart && server.scope == .global {
-            startMCPServer(server, cwd: selectedTab?.currentWorkingDirectory)
+            startMCPServer(server, cwd: nil)
         }
     }
 
@@ -678,77 +727,25 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func applyDefaultProviderIfNeeded(to tab: TerminalTabViewModel) {
-        tab.panes.forEach(applyDefaultProviderIfNeeded(to:))
-        refreshProviderLabel(for: tab)
-    }
-
-    private func refreshProviderLabel(for tab: TerminalTabViewModel) {
-        tab.panes.forEach(refreshProviderLabel(for:))
-    }
-
     private var lastAppliedConfigDirectories: [UUID: URL] = [:]
-
-    private func applyProjectConfigIfNeeded(to tab: TerminalTabViewModel, directory: URL?) {
-        guard let directory, let config = TermConfig.load(from: directory) else { return }
-
-        // Don't re-apply if we already applied config for this directory
-        if lastAppliedConfigDirectories[tab.id] == directory { return }
-        lastAppliedConfigDirectories[tab.id] = directory
-
-        if let profileName = config.profileName,
-           let profile = profiles.first(where: { $0.name.caseInsensitiveCompare(profileName) == .orderedSame }) {
-            tab.applyProfile(profile)
-        }
-
-        if config.aiProvider != nil || config.aiModel != nil || config.classifierModel != nil {
-            var appearance = tab.appearance
-            if let aiProvider = config.aiProvider {
-                appearance.aiProvider = aiProvider
-            }
-            if let aiModel = config.aiModel {
-                appearance.aiModel = aiModel
-            }
-            if let classifierModel = config.classifierModel {
-                appearance.classifierModel = classifierModel
-            }
-            tab.appearance = appearance
-        }
-
-        if !config.mcpServers.isEmpty {
-            for serverID in config.mcpServers {
-                if let definition = mcpServers.first(where: { $0.id == serverID }) {
-                    startMCPServer(definition, cwd: directory)
-                }
-        }
-        }
-
-        // Auto-start default agent if configured
-        if let agentID = config.defaultAgent, config.agentAutoStart {
-            if let agentDef = agent(for: agentID) {
-                // Only launch if no agent tab already open for this project
-                let hasAgentTab = tabs.contains { tab in
-                    if case .agent(let def) = tab.kind, def.id == agentID { return true }
-                    return false
-                }
-                if !hasAgentTab {
-                    launchAgent(agentDef, from: tab)
-                }
-            }
-        }
-
-        refreshProviderLabel(for: tab)
-    }
 
     private func persistProfiles() {
         profileStore.save(.init(defaultProfileID: defaultProfileID, profiles: profiles))
     }
 
     private func persistProviders() {
+        // Collect OAuth client IDs from builtin providers (user-entered)
+        var oauthClientIDs: [String: String] = [:]
+        for p in providers where p.isBuiltin {
+            if let clientID = p.oauthConfig?.clientID, !clientID.isEmpty {
+                oauthClientIDs[p.id] = clientID
+            }
+        }
         providerStore.save(.init(
             providers: providers.filter { !$0.isBuiltin },
             defaultProviderID: defaultProviderID,
-            defaultModelID: defaultModelID
+            defaultModelID: defaultModelID,
+            oauthClientIDs: oauthClientIDs
         ))
     }
 
@@ -895,7 +892,7 @@ final class AppModel: ObservableObject {
     private func answerQuery(_ input: String, for pane: TerminalPaneViewModel) async {
         pane.queryResponse = QueryResponseState(text: "", isStreaming: true, suggestions: [])
 
-        // Try local MCP answer first
+        // Try local MCP answer first (quick offline fallback)
         if let mcpAnswer = mcpHost.localFilesystemAnswer(question: input, cwd: pane.currentWorkingDirectory) {
             pane.queryResponse = QueryResponseState(text: mcpAnswer, isStreaming: false, suggestions: [])
             pane.conversationHistory.addUserMessage(input)
@@ -911,62 +908,93 @@ final class AppModel: ObservableObject {
 
         do {
             // Build system message with context
-            let toolDescriptions = mcpHost.toolList().map { "- \($0.name) (\($0.serverID))" }.joined(separator: "\n")
             let systemPrompt = """
             You answer terminal questions concisely. If a shell command would help, include it in a fenced ```bash block.
             Current directory: \(pane.currentWorkingDirectory?.path ?? "unknown")
             Recent commands: \(pane.terminalContext().lastCommands.joined(separator: " | "))
-            \(toolDescriptions.isEmpty ? "" : "Available MCP tools:\n\(toolDescriptions)")
+            You have access to MCP tools. Use them when the user's question requires real data from their filesystem, git, or other connected services.
             """
 
-            // Update conversation history
             pane.conversationHistory.addSystemMessage(systemPrompt)
             let userMsg = "Last output: \(pane.terminalContext().lastOutputSnippet)\n\nQuestion: \(input)"
             pane.conversationHistory.addUserMessage(userMsg)
 
-            let stream = try providerRouter.streamResponse(
-                provider: provider,
-                modelID: modelID,
-                messages: pane.conversationHistory.messages
-            )
+            let toolSchemas = mcpHost.toolSchemas()
+            let maxToolRoundTrips = 5
 
-            for try await chunk in stream {
-                pane.queryResponse.text.append(chunk)
+            // Tool call loop: stream response, execute any tool calls, feed results back
+            for _ in 0..<maxToolRoundTrips {
+                var responseText = ""
+                var toolCalls: [ToolCallRequest] = []
+
+                if toolSchemas.isEmpty {
+                    // No tools available — use simple text-only streaming
+                    let stream = try providerRouter.streamResponse(
+                        provider: provider,
+                        modelID: modelID,
+                        messages: pane.conversationHistory.simplifiedMessages
+                    )
+                    for try await chunk in stream {
+                        responseText.append(chunk)
+                        pane.queryResponse.text.append(chunk)
+                    }
+                } else {
+                    // Stream with tool support
+                    let stream = try providerRouter.streamWithTools(
+                        provider: provider,
+                        modelID: modelID,
+                        richMessages: pane.conversationHistory.messages,
+                        tools: toolSchemas
+                    )
+                    for try await event in stream {
+                        switch event {
+                        case .text(let chunk):
+                            responseText.append(chunk)
+                            pane.queryResponse.text.append(chunk)
+                        case .toolCall(let request):
+                            toolCalls.append(request)
+                        }
+                    }
+                }
+
+                if toolCalls.isEmpty {
+                    // No tool calls — we're done
+                    pane.conversationHistory.addAssistantMessage(responseText)
+                    break
+                }
+
+                // Execute tool calls and collect results
+                var toolResults: [ToolCallResult] = []
+                for call in toolCalls {
+                    do {
+                        let result = try await mcpHost.callTool(name: call.name, arguments: call.arguments)
+                        toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: result))
+                        pane.queryResponse.text.append("\n\n*[Used tool: \(call.name)]*\n")
+                    } catch {
+                        let errorMsg = "Tool '\(call.name)' failed: \(error.localizedDescription)"
+                        toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: errorMsg))
+                        pane.queryResponse.text.append("\n\n*[\(errorMsg)]*\n")
+                    }
+                }
+
+                // Add the assistant message with tool calls and results to history
+                pane.conversationHistory.addAssistantToolCallMessage(
+                    text: responseText,
+                    toolCalls: toolCalls,
+                    toolResults: toolResults
+                )
+                // Loop continues — next iteration sends history with tool results,
+                // prompting the model to generate a final answer
             }
 
             pane.queryResponse.isStreaming = false
             pane.queryResponse.suggestions = extractSuggestions(from: pane.queryResponse.text)
-            pane.conversationHistory.addAssistantMessage(pane.queryResponse.text)
-
-            // Handle tool calls in the response (simple detection)
-            await handleToolCallsIfPresent(in: pane.queryResponse.text, for: pane, provider: provider, modelID: modelID)
         } catch {
             pane.queryResponse = QueryResponseState(
                 text: "Query failed: \(error.localizedDescription)",
                 isStreaming: false,
                 suggestions: []
             )
-        }
-    }
-
-    private func handleToolCallsIfPresent(in responseText: String, for pane: TerminalPaneViewModel, provider: ModelProvider, modelID: String) async {
-        // Check if the AI response mentions using an MCP tool (simple heuristic)
-        // In a full implementation, this would parse function_call/tool_use from the API response
-        // For now, detect patterns like "Let me use the X tool" or tool invocation syntax
-        let toolNames = mcpHost.toolList().map(\.name)
-        for toolName in toolNames {
-            if responseText.contains("calling \(toolName)") || responseText.contains("using \(toolName)") {
-                do {
-                    let result = try await mcpHost.callTool(name: toolName, arguments: [:])
-                    let toolMsg = "\n\n**Tool result (\(toolName)):**\n\(result)"
-                    pane.queryResponse.text.append(toolMsg)
-                    pane.queryResponse.suggestions = extractSuggestions(from: pane.queryResponse.text)
-                    pane.conversationHistory.addAssistantMessage(toolMsg)
-                } catch {
-                    pane.queryResponse.text.append("\n\nTool call failed: \(error.localizedDescription)")
-                }
-                break
-            }
         }
     }
 
@@ -990,5 +1018,148 @@ final class AppModel: ObservableObject {
         case "OPENCLAW_API_KEY": return "openclaw"
         default: return envVar.lowercased()
         }
+    }
+
+    // MARK: - WindowModel Support (called by per-window WindowModel)
+
+    func restoreTabViewModels() -> [TerminalTabViewModel] {
+        let storedTabs = sessionStore.loadTabs()
+        return storedTabs.compactMap { descriptor in
+            let storedPanes = descriptor.panes ?? [
+                SessionStore.StoredPane(
+                    id: descriptor.activePaneID ?? UUID(),
+                    title: descriptor.title,
+                    workingDirectoryPath: descriptor.workingDirectoryPath,
+                    profileID: descriptor.profileID,
+                    agentDefinitionID: descriptor.agentDefinitionID
+                )
+            ]
+            let panes = storedPanes.compactMap { self.makePane(from: $0) }
+            guard !panes.isEmpty else { return nil }
+            let profile = profiles.first(where: { $0.id == panes.first?.profileID }) ?? defaultProfile
+            let tab = TerminalTabViewModel(
+                id: descriptor.id,
+                workingDirectory: panes.first?.currentWorkingDirectory,
+                profile: profile,
+                kind: panes.first?.kind ?? .shell,
+                panes: panes,
+                activePaneID: descriptor.activePaneID ?? panes.first?.id,
+                splitOrientation: descriptor.resolvedSplitOrientation
+            )
+            return tab
+        }
+    }
+
+    func makeShellTab(workingDirectory: URL? = nil) -> TerminalTabViewModel {
+        let tab = TerminalTabViewModel(
+            initialTitle: "zsh",
+            workingDirectory: workingDirectory,
+            profile: defaultProfile
+        )
+        applyDefaultProviderIfNeeded(to: tab)
+        return tab
+    }
+
+    func makeAgentTab(_ definition: AgentDefinition, workingDirectory: URL?) -> TerminalTabViewModel? {
+        guard let executablePath = agentStatuses[definition.id]?.executablePath else { return nil }
+
+        var environment: [String: String] = [:]
+        if let authValue = try? keychainStore.readSecret(account: providerSecretAccount(forEnvVar: definition.authEnvVar)),
+           !authValue.isEmpty {
+            environment[definition.authEnvVar] = authValue
+        }
+
+        let launchConfiguration = PTYLaunchConfiguration.agent(
+            executablePath: executablePath,
+            arguments: definition.args,
+            environment: environment,
+            workingDirectory: workingDirectory,
+            displayName: definition.name
+        )
+
+        let tab = TerminalTabViewModel(
+            initialTitle: definition.name,
+            workingDirectory: workingDirectory,
+            profile: defaultProfile,
+            kind: .agent(definition),
+            launchConfiguration: launchConfiguration
+        )
+        applyDefaultProviderIfNeeded(to: tab)
+        return tab
+    }
+
+    func applyProjectConfigIfNeeded(to tab: TerminalTabViewModel, directory: URL?) {
+        guard let directory, let config = TermConfig.load(from: directory) else { return }
+
+        if lastAppliedConfigDirectories[tab.id] == directory { return }
+        lastAppliedConfigDirectories[tab.id] = directory
+
+        if let profileName = config.profileName,
+           let profile = profiles.first(where: { $0.name.caseInsensitiveCompare(profileName) == .orderedSame }) {
+            tab.applyProfile(profile)
+        }
+
+        if config.aiProvider != nil || config.aiModel != nil || config.classifierModel != nil {
+            var appearance = tab.appearance
+            if let aiProvider = config.aiProvider { appearance.aiProvider = aiProvider }
+            if let aiModel = config.aiModel { appearance.aiModel = aiModel }
+            if let classifierModel = config.classifierModel { appearance.classifierModel = classifierModel }
+            tab.appearance = appearance
+        }
+
+        if !config.mcpServers.isEmpty {
+            for serverID in config.mcpServers {
+                if let definition = mcpServers.first(where: { $0.id == serverID }) {
+                    startMCPServer(definition, cwd: directory)
+                }
+            }
+        }
+
+        refreshProviderLabel(for: tab)
+    }
+
+    func applyDefaultProviderIfNeeded(to tab: TerminalTabViewModel) {
+        tab.panes.forEach(applyDefaultProviderIfNeeded(to:))
+        refreshProviderLabel(for: tab)
+    }
+
+    func refreshProviderLabel(for tab: TerminalTabViewModel) {
+        tab.panes.forEach(refreshProviderLabel(for:))
+    }
+
+    func persistProfilesPublic() {
+        persistProfiles()
+    }
+
+    func persistTabs(_ tabs: [TerminalTabViewModel], windowID: UUID) {
+        // For now, persist only the primary window's tabs (first window to persist wins)
+        sessionStore.saveTabs(
+            tabs.map {
+                SessionStore.StoredTab(
+                    id: $0.id,
+                    title: $0.title,
+                    workingDirectoryPath: $0.currentWorkingDirectory?.path,
+                    profileID: $0.profileID,
+                    agentDefinitionID: nil,
+                    activePaneID: $0.activePaneID,
+                    splitOrientation: $0.splitOrientation?.rawValue,
+                    panes: $0.panes.map {
+                        let agentDefinitionID: String?
+                        if case let .agent(agent) = $0.kind {
+                            agentDefinitionID = agent.id
+                        } else {
+                            agentDefinitionID = nil
+                        }
+                        return SessionStore.StoredPane(
+                            id: $0.id,
+                            title: $0.title,
+                            workingDirectoryPath: $0.currentWorkingDirectory?.path,
+                            profileID: $0.profileID,
+                            agentDefinitionID: agentDefinitionID
+                        )
+                    }
+                )
+            }
+        )
     }
 }

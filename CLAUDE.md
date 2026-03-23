@@ -35,11 +35,70 @@ AppMain (@main)
 
 **AppModel** is the single source of truth. Views consume it via `@EnvironmentObject`. All view models and the classifier are `@MainActor final class` using `@Published` properties.
 
+## Folder Structure
+
+Source files are organized by domain following Appendix A from the design spec:
+
+```
+Sources/aTerm/
+├── AppMain.swift              # @main entry point
+├── AppModel.swift             # Central orchestrator
+├── WindowModel.swift          # Per-window state
+├── Logger.swift               # Logging utilities
+│
+├── Terminal/                  # Terminal emulation core
+│   ├── PTYSession.swift       # forkpty wrapper
+│   ├── TerminalBuffer.swift   # Grid-based cell model
+│   ├── VT100Parser.swift      # Escape sequence state machine
+│   ├── TerminalView.swift     # Rendering (Core Text)
+│   ├── TerminalTabViewModel.swift  # Tab + pane view models
+│   ├── TerminalAppearance.swift    # Visual settings
+│   ├── ZshRuntime.swift       # Shell integration
+│   ├── FontSupport.swift      # Nerd Font detection
+│   ├── ANSIParser.swift       # ANSI color support
+│   └── TerminalStreamDecoder.swift # UTF-8 decoding
+│
+├── AI/                        # AI provider system
+│   ├── InputClassifier.swift  # Heuristic + LLM classification
+│   ├── ProviderRouter.swift   # HTTP streaming to providers
+│   ├── BuiltinProviders.swift # Provider presets
+│   ├── AgentRegistry.swift    # Agent definitions
+│   └── AssistantSession.swift # AI conversation
+│
+├── MCP/                       # Model Context Protocol
+│   ├── MCPHost.swift          # MCP host implementation
+│   └── MCPRegistry.swift      # Server registry
+│
+├── Config/                    # Persistence & settings
+│   ├── SessionStore.swift     # Tab state persistence
+│   ├── ProfileStore.swift     # Profile storage
+│   ├── ProviderStore.swift    # Provider config storage
+│   ├── ThemeStore.swift       # Theme storage
+│   ├── KeychainStore.swift    # Secure credential storage
+│   ├── KeybindingStore.swift  # Keybinding storage
+│   ├── TermConfig.swift       # .termconfig parser
+│   └── AppSupport.swift       # App Support utilities
+│
+├── Themes/                    # Theme system
+│   ├── TerminalTheme.swift    # Theme data model
+│   ├── BuiltinThemes.swift    # Built-in themes
+│   ├── ThemeParser.swift      # .itermcolors parser
+│   ├── ThemeCatalog.swift     # Theme browser/download
+│   └── ThemeColor.swift       # Color utilities
+│
+└── UI/                        # SwiftUI views
+    ├── ContentView.swift      # Main window content
+    ├── SettingsView.swift     # Preferences window
+    ├── TabStripView.swift     # Tab bar
+    ├── AppearanceSidebarView.swift  # Theme browser
+    └── OnboardingView.swift   # First-launch wizard
+```
+
 ### Terminal Emulation
 
-- **TerminalBuffer** — Grid-based model: rows x columns of `TerminalCell` (character + `CellAttributes` with fg/bg color, bold, italic, underline, dim, strikethrough, inverse). Supports main + alternate screen buffers, scroll regions, cursor save/restore, scrollback, DEC line drawing charset, wide/CJK character detection, mouse mode tracking, prompt marks for semantic scrollback.
-- **VT100Parser** — Full state machine: SGR colors (16, 256, 24-bit RGB), cursor movement, screen clearing, scroll regions (DECSTBM), alternate screen (DECSET 1049/47), insert/delete, OSC for title/cwd/OSC 133 prompt markers, bracketed paste, application cursor keys, mouse modes (1000/1002/1003/1006), DEC charset designation (G0/G1).
-- **TerminalGridView** — Custom `NSView` using Core Text. Draws cells with proper colors and font attributes. Supports text selection (drag, double-click word, triple-click line), Cmd+C/V clipboard, right-click context menu, mouse reporting for TUI apps, file drag-drop. Theme ANSI palette colors mapped for indices 0-15.
+- **TerminalBuffer** — Grid-based model: rows x columns of `TerminalCell` (character + `CellAttributes` with fg/bg color, bold, italic, underline, dim, strikethrough, inverse, hyperlinkURL). Supports main + alternate screen buffers, scroll regions, cursor save/restore, scrollback, DEC line drawing charset, wide/CJK character detection, mouse mode tracking, focus event mode (1004), prompt marks for semantic scrollback.
+- **VT100Parser** — Full state machine: SGR colors (16, 256, 24-bit RGB), cursor movement, screen clearing, scroll regions (DECSTBM), alternate screen (DECSET 1049/47), insert/delete, OSC for title/cwd/OSC 133 prompt markers/OSC 52 clipboard/OSC 8 hyperlinks, bracketed paste, application cursor keys, mouse modes (1000/1002/1003/1006), focus events (1004), DEC charset designation (G0/G1).
+- **TerminalGridView** — Custom `NSView` using Core Text. Draws cells with proper colors and font attributes. Supports text selection (drag, double-click word, triple-click line), Cmd+C/V clipboard, Cmd+click URL opening (OSC 8 hyperlinks + NSDataDetector URL detection), right-click context menu, mouse reporting for TUI apps, file drag-drop, cursor blink animation. Theme ANSI palette colors mapped for indices 0-15.
 - **TerminalKeyMapper** — Full keyboard: Ctrl+A-Z (0x01-0x1a), F1-F12, Home/End/PgUp/PgDn/Insert/Delete, arrow keys with Ctrl/Alt/Shift, application cursor mode, Alt+key meta encoding.
 
 PTY output flows: `PTYSession` → `VT100Parser.feed(data)` → `TerminalBuffer` state updates → `TerminalGridView.needsDisplay`. The `displayText` string for search is only regenerated when search is active (200ms debounce).
@@ -75,7 +134,9 @@ User input goes through `AppModel.submitInput(for: pane)`:
 - Initialize handshake → tools/list discovery → tools/call routing
 - Reconnection with 2s backoff, max 5 retries on crash
 - `callTool(name:arguments:)` routes to correct server and returns text result
-- Tool schemas exposed to AI via `ToolSchema` in ProviderRouter request bodies
+- `toolSchemas()` converts `MCPToolDescriptor` (with description + inputSchema) to `ToolSchema` for API requests
+- `ProviderRouter.streamWithTools()` parses `function_call`/`tool_use` from OpenAI and Anthropic streaming SSE responses, accumulating arguments across chunks
+- `AppModel.answerQuery()` runs a tool call loop (up to 5 round-trips): stream → detect tool calls → execute via MCPHost → feed `RichMessage` results back → continue generation
 
 ### Tabs & Panes
 
