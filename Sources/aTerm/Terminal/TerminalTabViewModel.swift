@@ -44,10 +44,19 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     @Published private(set) var currentSearchIndex = 0
     /// Incremented on every buffer update to trigger SwiftUI redraw
     @Published private(set) var bufferVersion: UInt64 = 0
+    /// True when the running program has switched to the alternate screen (e.g. vim, less, claude)
+    @Published private(set) var isAlternateScreen = false
+    
+    // MARK: - Chat Mode
+    @Published var isChatModeActive = false
+    @Published var chatProviderID: String?
+    @Published var chatModelID: String?
+    let chatConversationHistory = ConversationHistory()
 
     private(set) var profileID: UUID?
     private(set) var profileName: String
     var stateDidChange: (() -> Void)?
+    var onChatRequest: ((String) -> Void)?
 
     private var preferredWorkingDirectory: URL?
     private var currentColumns: UInt16 = 100
@@ -60,7 +69,12 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     let conversationHistory = ConversationHistory()
     private var recentCommands: [String] = []
     private var lastOutputSnippet = ""
+    private var lastExitCode: Int32?
+    private var recentFailures: [String] = []
+    private var sessionStartTime: Date?
+    private var projectInfo: ProjectContextDetector.ProjectInfo = ProjectContextDetector.ProjectInfo(type: .generic, gitBranch: nil, rootDirectory: nil)
     private let explicitLaunchConfiguration: PTYLaunchConfiguration?
+    private let projectDetector = ProjectContextDetector.shared
 
     init(
         id: UUID = UUID(),
@@ -117,13 +131,41 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     func handleInput(_ data: Data) {
-        guard let session else { return }
+        guard let session else {
+            Log.debug("input", "handleInput: no session, dropping \(data.count) bytes")
+            return
+        }
+
+        // Check for chat command interception
+        if let text = String(data: data, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.lowercased() == "/chat-exit" {
+                exitChatMode()
+                return
+            }
+            if trimmed.lowercased().hasPrefix("/chat ") || trimmed.lowercased() == "/chat" {
+                let chatContent = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+                enterChatMode(providerID: appearance.chatProvider, modelID: appearance.chatModel)
+                if !chatContent.isEmpty {
+                    // Process the chat message via callback
+                    onChatRequest?(chatContent)
+                }
+                return
+            }
+            // If in chat mode, treat all input as chat messages
+            if isChatModeActive && !trimmed.isEmpty {
+                onChatRequest?(trimmed)
+                return
+            }
+        }
 
         if session.isRunning {
+            Log.debug("input", "handleInput: sending \(data.count) bytes to PTY")
             session.send(data)
             return
         }
 
+        Log.debug("input", "handleInput: session not running, attempting restart")
         restartSessionIfPossible()
     }
 
@@ -132,8 +174,8 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         guard columns != currentColumns || rows != currentRows else { return }
         currentColumns = columns
         currentRows = rows
-        terminalBuffer.resize(columns: Int(columns), rows: Int(rows))
         session?.resize(columns: columns, rows: rows)
+        terminalBuffer.resize(columns: Int(columns), rows: Int(rows))
         bufferVersion &+= 1
     }
 
@@ -153,10 +195,20 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     func terminalContext() -> ClassificationContext {
-        ClassificationContext(
+        // Update project info if working directory changed
+        if let cwd = currentWorkingDirectory {
+            projectInfo = projectDetector.detectProjectInfo(for: cwd)
+        }
+        
+        return ClassificationContext(
             workingDirectory: currentWorkingDirectory,
-            lastCommands: Array(recentCommands.suffix(3)),
-            lastOutputSnippet: lastOutputSnippet
+            lastCommands: Array(recentCommands.suffix(5)),
+            lastOutputSnippet: lastOutputSnippet,
+            lastExitCode: lastExitCode.map(Int.init),
+            gitBranch: projectInfo.gitBranch,
+            projectType: projectInfo.type,
+            recentFailures: Array(recentFailures.suffix(3)),
+            sessionDuration: sessionStartTime.map { Date().timeIntervalSince($0) }
         )
     }
 
@@ -186,6 +238,23 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         aiShellState = AIShellState()
         submissionState = .idle
         modeIndicatorText = isAgentTab ? "AGENT" : InputMode.terminal.rawValue
+    }
+    
+    // MARK: - Chat Mode
+    
+    func enterChatMode(providerID: String?, modelID: String?) {
+        isChatModeActive = true
+        chatProviderID = providerID
+        chatModelID = modelID
+        modeIndicatorText = "CHAT"
+        chatConversationHistory.clear()
+    }
+    
+    func exitChatMode() {
+        isChatModeActive = false
+        modeIndicatorText = isAgentTab ? "AGENT" : InputMode.terminal.rawValue
+        // Clear conversation history when exiting chat mode
+        chatConversationHistory.clear()
     }
 
     func clearScrollback() {
@@ -251,6 +320,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         Log.debug("pty", "startSession() pane=\(id) kind=\(isAgentTab ? "agent" : "shell")")
         outputTask?.cancel()
         vt100Parser.reset()
+        sessionStartTime = Date()
 
         do {
             let configuration = try sessionConfiguration()
@@ -277,6 +347,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
                         self.vt100Parser.feed(data)
                         // Sync mode flags
                         TerminalKeyMapper.applicationCursorKeys = self.terminalBuffer.applicationCursorKeys
+                        self.isAlternateScreen = self.terminalBuffer.isAlternateScreen
                         // Handle bell
                         if self.terminalBuffer.bellFired {
                             self.terminalBuffer.bellFired = false
@@ -319,6 +390,16 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     private func handleExit(status: Int32) {
+        lastExitCode = status
+        
+        // Track failed commands for context
+        if status != 0, let lastCommand = recentCommands.last {
+            recentFailures.append(lastCommand)
+            if recentFailures.count > 10 {
+                recentFailures.removeFirst(recentFailures.count - 10)
+            }
+        }
+        
         statusText = "session ended (\(status))"
         // Write exit message into the buffer
         let exitMsg = "\r\n[session ended — press any key to restart]"
@@ -552,6 +633,7 @@ final class TerminalTabViewModel: ObservableObject, Identifiable {
         clone.stateDidChange = { [weak self] in
             self?.stateDidChange?()
         }
+        clone.onChatRequest = activePane.onChatRequest
         panes.append(clone)
         activePaneID = clone.id
         splitOrientation = splitOrientation ?? orientation

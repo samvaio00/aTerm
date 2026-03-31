@@ -80,7 +80,8 @@ final class AppModel: ObservableObject {
     }
 
     var allThemes: [TerminalTheme] {
-        BuiltinThemes.all + importedThemes
+        // Single theme only - modern bright theme
+        BuiltinThemes.all
     }
 
     var availableProviders: [ModelProvider] {
@@ -369,6 +370,7 @@ final class AppModel: ObservableObject {
     }
 
     func submitInput(for pane: TerminalPaneViewModel) {
+        Log.debug("input", "submitInput called, inputText='\(pane.inputText)', isAgent=\(pane.isAgentTab)")
         if pane.isAgentTab {
             let command = pane.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !command.isEmpty else { return }
@@ -379,6 +381,38 @@ final class AppModel: ObservableObject {
 
         let rawInput = pane.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawInput.isEmpty else { return }
+        
+        // Handle /chat-exit command
+        if inputClassifier.isChatExitCommand(rawInput) {
+            pane.exitChatMode()
+            pane.inputText = ""
+            return
+        }
+        
+        // Handle /chat command - enter chat mode
+        if inputClassifier.isChatCommand(rawInput) {
+            let displayInput = inputClassifier.strippedOverrideInput(rawInput)
+            pane.inputText = ""
+            // Enter chat mode with separate chat model if configured
+            pane.enterChatMode(providerID: pane.appearance.chatProvider, modelID: pane.appearance.chatModel)
+            // Process the chat message immediately if there's content
+            if !displayInput.isEmpty {
+                Task { @MainActor in
+                    await answerChatQuery(displayInput, for: pane)
+                }
+            }
+            return
+        }
+        
+        // If in chat mode, process all input as chat
+        if pane.isChatModeActive {
+            pane.inputText = ""
+            Task { @MainActor in
+                await answerChatQuery(rawInput, for: pane)
+            }
+            return
+        }
+        
         let displayInput = inputClassifier.strippedOverrideInput(rawInput)
         pane.inputText = ""
 
@@ -387,34 +421,24 @@ final class AppModel: ObservableObject {
             let classifierModelID = pane.appearance.classifierModel ?? pane.appearance.aiModel
 
             do {
-                let classification = try await inputClassifier.classify(
+                let result = try await inputClassifier.classify(
                     rawInput,
                     context: pane.terminalContext(),
                     provider: provider,
                     modelID: classifierModelID
                 )
 
-                guard let classification else {
+                guard let result else {
                     pane.submissionState = .waitingForDisambiguation(displayInput)
                     pane.modeIndicatorText = "AMBIGUOUS"
                     return
                 }
 
-                switch classification {
-                case .terminal:
-                    pane.clearAssistantState()
-                    pane.sendTerminalCommand(displayInput)
-                case .aiToShell:
-                    pane.queryResponse = QueryResponseState()
-                    pane.submissionState = .idle
-                    pane.modeIndicatorText = InputMode.aiToShell.rawValue
-                    await generateShellCommand(from: displayInput, for: pane)
-                case .query:
-                    pane.aiShellState = AIShellState()
-                    pane.submissionState = .idle
-                    pane.modeIndicatorText = InputMode.query.rawValue
-                    await answerQuery(displayInput, for: pane)
-                }
+                // Log classification explanation for debugging
+                Log.debug("classifier", "Input: '\(displayInput)' -> \(result.mode.rawValue) (\(result.confidence.description): \(String(format: "%.2f", result.score)))")
+                Log.debug("classifier", "Reasons: \(result.explanation.reasons.joined(separator: "; "))")
+
+                await executeClassificationResult(result, input: displayInput, rawInput: rawInput, pane: pane)
             } catch {
                 pane.queryResponse = QueryResponseState(
                     text: "Classification failed: \(error.localizedDescription)",
@@ -426,9 +450,55 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func executeClassificationResult(
+        _ result: ClassificationResult,
+        input: String,
+        rawInput: String,
+        pane: TerminalPaneViewModel
+    ) async {
+        // Result available for potential feedback tracking
+
+        switch result.mode {
+        case .terminal:
+            // Check for dangerous commands
+            if inputClassifier.isDangerousCommand(input) {
+                pane.queryResponse = QueryResponseState(
+                    text: "⚠️ Warning: This command may be destructive. Press ⌘↵ to execute anyway, or try '!' prefix to ask about it.",
+                    isStreaming: false,
+                    suggestions: []
+                )
+                pane.modeIndicatorText = "WARNING"
+                return
+            }
+            
+            pane.clearAssistantState()
+            pane.sendTerminalCommand(input)
+            
+        case .aiToShell:
+            pane.queryResponse = QueryResponseState()
+            pane.submissionState = .idle
+            pane.modeIndicatorText = "\(InputMode.aiToShell.rawValue) (\(result.confidence.description))"
+            await generateShellCommand(from: input, for: pane)
+            
+        case .query:
+            pane.aiShellState = AIShellState()
+            pane.submissionState = .idle
+            pane.modeIndicatorText = "\(InputMode.query.rawValue) (\(result.confidence.description))"
+            await answerQuery(input, for: pane)
+        }
+    }
+
     func resolveDisambiguation(as mode: InputMode, for pane: TerminalPaneViewModel) {
         guard case let .waitingForDisambiguation(input) = pane.submissionState else { return }
         pane.submissionState = .idle
+        
+        // Record user choice for learning
+        ClassificationFeedbackStore.shared.recordDisambiguationChoice(
+            input: input,
+            chosenMode: mode,
+            context: pane.terminalContext()
+        )
+        
         switch mode {
         case .terminal:
             pane.clearAssistantState()
@@ -444,6 +514,21 @@ final class AppModel: ObservableObject {
                 await answerQuery(input, for: pane)
             }
         }
+    }
+    
+    /// Records feedback when user corrects a classification
+    func recordClassificationFeedback(
+        input: String,
+        originalMode: InputMode,
+        correctedMode: InputMode,
+        pane: TerminalPaneViewModel
+    ) {
+        ClassificationFeedbackStore.shared.recordCorrection(
+            input: input,
+            originalMode: originalMode,
+            correctedMode: correctedMode,
+            context: pane.terminalContext()
+        )
     }
 
     func runGeneratedCommand(for pane: TerminalPaneViewModel) {
@@ -923,79 +1008,73 @@ final class AppModel: ObservableObject {
             let userMsg = "Last output: \(pane.terminalContext().lastOutputSnippet)\n\nQuestion: \(input)"
             pane.conversationHistory.addUserMessage(userMsg)
 
-            let toolSchemas = mcpHost.toolSchemas()
-            let maxToolRoundTrips = 5
-
-            // Tool call loop: stream response, execute any tool calls, feed results back
-            for _ in 0..<maxToolRoundTrips {
-                var responseText = ""
-                var toolCalls: [ToolCallRequest] = []
-
-                if toolSchemas.isEmpty {
-                    // No tools available — use simple text-only streaming
-                    let stream = try providerRouter.streamResponse(
-                        provider: provider,
-                        modelID: modelID,
-                        messages: pane.conversationHistory.simplifiedMessages
-                    )
-                    for try await chunk in stream {
-                        responseText.append(chunk)
-                        pane.queryResponse.text.append(chunk)
-                    }
-                } else {
-                    // Stream with tool support
-                    let stream = try providerRouter.streamWithTools(
-                        provider: provider,
-                        modelID: modelID,
-                        richMessages: pane.conversationHistory.messages,
-                        tools: toolSchemas
-                    )
-                    for try await event in stream {
-                        switch event {
-                        case .text(let chunk):
-                            responseText.append(chunk)
-                            pane.queryResponse.text.append(chunk)
-                        case .toolCall(let request):
-                            toolCalls.append(request)
-                        }
-                    }
-                }
-
-                if toolCalls.isEmpty {
-                    // No tool calls — we're done
-                    pane.conversationHistory.addAssistantMessage(responseText)
-                    break
-                }
-
-                // Execute tool calls and collect results
-                var toolResults: [ToolCallResult] = []
-                for call in toolCalls {
-                    do {
-                        let result = try await mcpHost.callTool(name: call.name, arguments: call.arguments)
-                        toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: result))
-                        pane.queryResponse.text.append("\n\n*[Used tool: \(call.name)]*\n")
-                    } catch {
-                        let errorMsg = "Tool '\(call.name)' failed: \(error.localizedDescription)"
-                        toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: errorMsg))
-                        pane.queryResponse.text.append("\n\n*[\(errorMsg)]*\n")
-                    }
-                }
-
-                // Add the assistant message with tool calls and results to history
-                pane.conversationHistory.addAssistantToolCallMessage(
-                    text: responseText,
-                    toolCalls: toolCalls,
-                    toolResults: toolResults
-                )
-                // Loop continues — next iteration sends history with tool results,
-                // prompting the model to generate a final answer
-            }
-
-            pane.queryResponse.isStreaming = false
-            pane.queryResponse.suggestions = extractSuggestions(from: pane.queryResponse.text)
+            pane.queryResponse = try await streamAIResponse(
+                provider: provider,
+                modelID: modelID,
+                conversationHistory: pane.conversationHistory,
+                initialResponse: pane.queryResponse
+            )
         } catch {
             pane.queryResponse = QueryResponseState(
                 text: "Query failed: \(error.localizedDescription)",
+                isStreaming: false,
+                suggestions: []
+            )
+        }
+    }
+
+    /// Answer query in chat mode (persistent context, uses separate chat model config)
+    func answerChatQuery(_ input: String, for pane: TerminalPaneViewModel) async {
+        // Reset response with streaming state
+        pane.queryResponse = QueryResponseState(text: "", isStreaming: true, suggestions: [])
+
+        // Use chat-specific provider/model if configured, otherwise fall back to default
+        let provider: ModelProvider
+        let modelID: String
+        
+        if let chatProviderID = pane.chatProviderID,
+           let chatModelID = pane.chatModelID,
+           let chatProvider = self.provider(for: chatProviderID) {
+            provider = chatProvider
+            modelID = chatModelID
+        } else if let defaultProvider = self.provider(for: pane.appearance.aiProvider),
+                  let defaultModel = pane.appearance.aiModel {
+            provider = defaultProvider
+            modelID = defaultModel
+        } else {
+            pane.queryResponse = QueryResponseState(
+                text: "No provider or model configured for chat mode. Set up chat model in Settings.",
+                isStreaming: false,
+                suggestions: []
+            )
+            return
+        }
+
+        do {
+            // Build chat system message (more conversational)
+            let systemPrompt = """
+            You are a helpful coding assistant. Answer questions about programming, terminal usage, and development workflows.
+            Be conversational but concise. When shell commands would help, include them in ```bash blocks.
+            Current directory: \(pane.currentWorkingDirectory?.path ?? "unknown")
+            """
+
+            // Initialize history if needed
+            if pane.chatConversationHistory.messages.isEmpty {
+                pane.chatConversationHistory.addSystemMessage(systemPrompt)
+            }
+            
+            pane.chatConversationHistory.addUserMessage(input)
+
+            // Stream response directly to pane (updates UI in real-time)
+            try await streamAIResponseToPane(
+                provider: provider,
+                modelID: modelID,
+                conversationHistory: pane.chatConversationHistory,
+                pane: pane
+            )
+        } catch {
+            pane.queryResponse = QueryResponseState(
+                text: "Chat query failed: \(error.localizedDescription)",
                 isStreaming: false,
                 suggestions: []
             )
@@ -1011,6 +1090,184 @@ final class AppModel: ObservableObject {
             let command = text[commandRange].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !command.isEmpty else { return nil }
             return QueryCommandSuggestion(command: command)
+        }
+    }
+
+    /// Shared AI response streaming logic for query and chat modes
+    /// Returns updated QueryResponseState since struct properties can't be passed as inout
+    private func streamAIResponse(
+        provider: ModelProvider,
+        modelID: String,
+        conversationHistory: ConversationHistory,
+        initialResponse: QueryResponseState
+    ) async throws -> QueryResponseState {
+        var queryResponse = initialResponse
+        let toolSchemas = mcpHost.toolSchemas()
+        let maxToolRoundTrips = 5
+
+        // Tool call loop: stream response, execute any tool calls, feed results back
+        for _ in 0..<maxToolRoundTrips {
+            var responseText = ""
+            var toolCalls: [ToolCallRequest] = []
+
+            if toolSchemas.isEmpty {
+                // No tools available — use simple text-only streaming
+                let stream = try providerRouter.streamResponse(
+                    provider: provider,
+                    modelID: modelID,
+                    messages: conversationHistory.simplifiedMessages
+                )
+                for try await chunk in stream {
+                    responseText.append(chunk)
+                    queryResponse.text.append(chunk)
+                }
+            } else {
+                // Stream with tool support
+                let stream = try providerRouter.streamWithTools(
+                    provider: provider,
+                    modelID: modelID,
+                    richMessages: conversationHistory.messages,
+                    tools: toolSchemas
+                )
+                for try await event in stream {
+                    switch event {
+                    case .text(let chunk):
+                        responseText.append(chunk)
+                        queryResponse.text.append(chunk)
+                    case .toolCall(let request):
+                        toolCalls.append(request)
+                    }
+                }
+            }
+
+            if toolCalls.isEmpty {
+                // No tool calls — we're done
+                conversationHistory.addAssistantMessage(responseText)
+                break
+            }
+
+            // Execute tool calls and collect results
+            var toolResults: [ToolCallResult] = []
+            for call in toolCalls {
+                do {
+                    let result = try await mcpHost.callTool(name: call.name, arguments: call.arguments)
+                    toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: result))
+                    queryResponse.text.append("\n\n*[Used tool: \(call.name)]*\n")
+                } catch {
+                    let errorMsg = "Tool '\(call.name)' failed: \(error.localizedDescription)"
+                    toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: errorMsg))
+                    queryResponse.text.append("\n\n*[\(errorMsg)]*\n")
+                }
+            }
+
+            // Add the assistant message with tool calls and results to history
+            conversationHistory.addAssistantToolCallMessage(
+                text: responseText,
+                toolCalls: toolCalls,
+                toolResults: toolResults
+            )
+            // Loop continues — next iteration sends history with tool results,
+            // prompting the model to generate a final answer
+        }
+
+        queryResponse.isStreaming = false
+        queryResponse.suggestions = extractSuggestions(from: queryResponse.text)
+        return queryResponse
+    }
+    
+    /// Streams AI response directly to pane (updates UI in real-time)
+    private func streamAIResponseToPane(
+        provider: ModelProvider,
+        modelID: String,
+        conversationHistory: ConversationHistory,
+        pane: TerminalPaneViewModel
+    ) async throws {
+        let toolSchemas = mcpHost.toolSchemas()
+        let maxToolRoundTrips = 5
+        var fullText = ""
+
+        // Tool call loop: stream response, execute any tool calls, feed results back
+        for _ in 0..<maxToolRoundTrips {
+            var responseText = ""
+            var toolCalls: [ToolCallRequest] = []
+
+            if toolSchemas.isEmpty {
+                // No tools available — use simple text-only streaming
+                let stream = try providerRouter.streamResponse(
+                    provider: provider,
+                    modelID: modelID,
+                    messages: conversationHistory.simplifiedMessages
+                )
+                for try await chunk in stream {
+                    responseText.append(chunk)
+                    fullText.append(chunk)
+                    // Update UI on main thread
+                    await MainActor.run {
+                        pane.queryResponse.text = fullText
+                    }
+                }
+            } else {
+                // Stream with tool support
+                let stream = try providerRouter.streamWithTools(
+                    provider: provider,
+                    modelID: modelID,
+                    richMessages: conversationHistory.messages,
+                    tools: toolSchemas
+                )
+                for try await event in stream {
+                    switch event {
+                    case .text(let chunk):
+                        responseText.append(chunk)
+                        fullText.append(chunk)
+                        await MainActor.run {
+                            pane.queryResponse.text = fullText
+                        }
+                    case .toolCall(let request):
+                        toolCalls.append(request)
+                    }
+                }
+            }
+
+            if toolCalls.isEmpty {
+                // No tool calls — we're done
+                conversationHistory.addAssistantMessage(responseText)
+                break
+            }
+
+            // Execute tool calls and collect results
+            var toolResults: [ToolCallResult] = []
+            for call in toolCalls {
+                do {
+                    let result = try await mcpHost.callTool(name: call.name, arguments: call.arguments)
+                    toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: result))
+                    let toolNote = "\n\n*[Used tool: \(call.name)]*\n"
+                    fullText.append(toolNote)
+                    await MainActor.run {
+                        pane.queryResponse.text = fullText
+                    }
+                } catch {
+                    let errorMsg = "Tool '\(call.name)' failed: \(error.localizedDescription)"
+                    toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: errorMsg))
+                    let errorNote = "\n\n*[\(errorMsg)]*\n"
+                    fullText.append(errorNote)
+                    await MainActor.run {
+                        pane.queryResponse.text = fullText
+                    }
+                }
+            }
+
+            // Add the assistant message with tool calls and results to history
+            conversationHistory.addAssistantToolCallMessage(
+                text: responseText,
+                toolCalls: toolCalls,
+                toolResults: toolResults
+            )
+        }
+
+        // Final update with suggestions and streaming complete
+        await MainActor.run {
+            pane.queryResponse.isStreaming = false
+            pane.queryResponse.suggestions = self.extractSuggestions(from: fullText)
         }
     }
 

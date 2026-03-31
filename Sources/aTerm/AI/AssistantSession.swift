@@ -18,9 +18,14 @@ struct AIShellState {
     var isEditing = false
 }
 
-enum InputSubmissionState {
+enum InputSubmissionState: Equatable {
     case idle
     case waitingForDisambiguation(String)
+    
+    var isWaiting: Bool {
+        if case .waitingForDisambiguation = self { return true }
+        return false
+    }
 }
 
 // MARK: - Tool Calling Types

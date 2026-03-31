@@ -13,9 +13,14 @@ struct TerminalView: NSViewRepresentable {
     let onInput: (Data) -> Void
     let onResize: (UInt16, UInt16) -> Void
     let onBecomeActive: () -> Void
+    var onChatExit: (() -> Void)?
+    var onChatEnter: ((String) -> Void)?
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onInput: onInput, onResize: onResize, onBecomeActive: onBecomeActive)
+        let coordinator = Coordinator(onInput: onInput, onResize: onResize, onBecomeActive: onBecomeActive)
+        coordinator.onChatExit = onChatExit
+        coordinator.onChatEnter = onChatEnter
+        return coordinator
     }
 
     func makeNSView(context: Context) -> TerminalContainerView {
@@ -27,6 +32,14 @@ struct TerminalView: NSViewRepresentable {
     func updateNSView(_ nsView: TerminalContainerView, context: Context) {
         nsView.applyAppearance(appearance, theme: theme)
         nsView.updateBuffer(buffer)
+        // Update chat callbacks in case they changed
+        context.coordinator.onChatExit = onChatExit
+        context.coordinator.onChatEnter = onChatEnter
+        // When the running program switches to alternate screen (vim, less, claude, etc.),
+        // grab keyboard focus so keystrokes go directly to the PTY
+        if buffer.isAlternateScreen {
+            nsView.focusTerminal()
+        }
         // Grid recalculation happens via layout() on frame change — not here.
     }
 
@@ -34,6 +47,8 @@ struct TerminalView: NSViewRepresentable {
         private let onInput: (Data) -> Void
         private let onResize: (UInt16, UInt16) -> Void
         private let onBecomeActive: () -> Void
+        var onChatExit: (() -> Void)?
+        var onChatEnter: ((String) -> Void)?
 
         init(onInput: @escaping (Data) -> Void, onResize: @escaping (UInt16, UInt16) -> Void, onBecomeActive: @escaping () -> Void) {
             self.onInput = onInput
@@ -49,6 +64,8 @@ struct TerminalView: NSViewRepresentable {
             let seq = focused ? "\u{1B}[I" : "\u{1B}[O"
             onInput(Data(seq.utf8))
         }
+        func sendChatExit() { onChatExit?() }
+        func sendChatEnter(content: String) { onChatEnter?(content) }
     }
 }
 
@@ -58,6 +75,8 @@ protocol TerminalInputHandling: AnyObject {
     func resize(columns: UInt16, rows: UInt16)
     func didBecomeActive()
     func sendFocusEvent(focused: Bool)
+    func sendChatExit()
+    func sendChatEnter(content: String)
 }
 
 // MARK: - Selection Model
@@ -138,22 +157,36 @@ final class TerminalContainerView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window?.makeFirstResponder(gridView)
-
+        
         // Focus event reporting (mode 1004)
         if let window {
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeKey), name: NSWindow.didBecomeKeyNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidResignKey), name: NSWindow.didResignKeyNotification, object: window)
         }
+        
+        // Always ensure terminal becomes first responder for traditional terminal mode
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            Log.debug("focus", "viewDidMoveToWindow - attempting to make gridView first responder")
+            let success = self.window?.makeFirstResponder(self.gridView) ?? false
+            Log.debug("focus", "makeFirstResponder result: \(success)")
+        }
     }
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {
+        Log.debug("focus", "windowDidBecomeKey")
+        // Ensure gridView becomes first responder when window becomes key
+        DispatchQueue.main.async { [weak self] in
+            let success = self?.window?.makeFirstResponder(self?.gridView) ?? false
+            Log.debug("focus", "windowDidBecomeKey makeFirstResponder: \(success)")
+        }
         if gridView.buffer?.focusEventMode == true {
             handler?.sendFocusEvent(focused: true)
         }
     }
 
     @objc private func windowDidResignKey(_ notification: Notification) {
+        Log.debug("focus", "windowDidResignKey")
         if gridView.buffer?.focusEventMode == true {
             handler?.sendFocusEvent(focused: false)
         }
@@ -162,6 +195,22 @@ final class TerminalContainerView: NSView {
     func configure(with handler: TerminalInputHandling) {
         self.handler = handler
         gridView.inputHandler = handler
+    }
+
+    func focusTerminal() {
+        Log.debug("focus", "focusTerminal called")
+        guard let window = window else {
+            Log.debug("focus", "focusTerminal: no window")
+            return
+        }
+        let success = window.makeFirstResponder(gridView)
+        Log.debug("focus", "focusTerminal result: \(success)")
+    }
+    
+    override func becomeFirstResponder() -> Bool {
+        Log.debug("focus", "TerminalContainerView becomeFirstResponder")
+        // Forward to gridView
+        return window?.makeFirstResponder(gridView) ?? false
     }
 
     func applyAppearance(_ appearance: TerminalAppearance, theme: TerminalTheme) {
@@ -192,7 +241,9 @@ final class TerminalContainerView: NSView {
 
         let totalLines = buffer.totalLineCount
         let lineHeight = gridView.cellHeight
-        let docHeight = max(CGFloat(totalLines) * lineHeight, scrollView.contentView.bounds.height)
+        // Add extra padding at bottom so cursor/prompt isn't hidden at edge
+        let bottomPadding: CGFloat = 8
+        let docHeight = max(CGFloat(totalLines) * lineHeight + bottomPadding, scrollView.contentView.bounds.height)
         gridView.frame = NSRect(x: 0, y: 0, width: scrollView.contentView.bounds.width, height: docHeight)
 
         if shouldFollowTail {
@@ -227,7 +278,7 @@ final class TerminalGridView: NSView {
     weak var containerView: TerminalContainerView?
     var buffer: TerminalBuffer?
 
-    private var font: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular)
+    private var font: NSFont = .monospacedSystemFont(ofSize: 18, weight: .medium)
     private var boldFont: NSFont = .monospacedSystemFont(ofSize: 13, weight: .bold)
     private var italicFont: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular)
     private var termAppearance: TerminalAppearance = .default
@@ -244,6 +295,10 @@ final class TerminalGridView: NSView {
     // Cursor blink state
     private var cursorBlinkVisible = true
     private var cursorBlinkTimer: Timer?
+    
+    // Local line buffer for intercepting /chat commands
+    private var localLineBuffer = ""
+    private var isLocalBufferActive = false
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
@@ -252,8 +307,9 @@ final class TerminalGridView: NSView {
         self.termAppearance = newAppearance
         self.theme = newTheme
 
+        // Use medium weight for better visibility
         font = NSFont(name: newAppearance.fontName, size: newAppearance.fontSize)
-            ?? .monospacedSystemFont(ofSize: newAppearance.fontSize, weight: .regular)
+            ?? .monospacedSystemFont(ofSize: newAppearance.fontSize, weight: .medium)
         boldFont = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
         let italicDesc = font.fontDescriptor.withSymbolicTraits(.italic)
         italicFont = NSFont(descriptor: italicDesc, size: newAppearance.fontSize) ?? font
@@ -405,7 +461,7 @@ final class TerminalGridView: NSView {
                 let screenRow = lineIndex - totalScrollback
                 if isScreenLine, screenRow == buffer.cursorY, col == buffer.cursorX, buffer.cursorVisible, cursorBlinkVisible {
                     ctx.setFillColor(cursorColor.nsColor.withAlphaComponent(0.6).cgColor)
-                    switch termAppearance.cursorStyle {
+                    switch buffer.cursorShape {
                     case .block: ctx.fill(cellRect)
                     case .bar: ctx.fill(CGRect(x: x, y: y, width: 2, height: cellHeight))
                     case .underline: ctx.fill(CGRect(x: x, y: y + cellHeight - 2, width: cellWidth, height: 2))
@@ -423,12 +479,10 @@ final class TerminalGridView: NSView {
                 else if attrs.italic { drawFont = italicFont }
                 else { drawFont = font }
 
-                var drawColor = fgColor
-                if attrs.dim { drawColor = drawColor.withAlpha(0.5) }
-
+                // Always draw at full brightness - ignore dim attribute for better visibility
                 let attrString = NSAttributedString(string: String(ch), attributes: [
                     .font: drawFont,
-                    .foregroundColor: drawColor.nsColor,
+                    .foregroundColor: fgColor.nsColor,
                 ])
                 let ctLine = CTLineCreateWithAttributedString(attrString)
 
@@ -440,14 +494,14 @@ final class TerminalGridView: NSView {
                 ctx.restoreGState()
 
                 if attrs.underline {
-                    ctx.setStrokeColor(drawColor.nsColor.cgColor)
+                    ctx.setStrokeColor(fgColor.nsColor.cgColor)
                     ctx.setLineWidth(1)
                     ctx.move(to: CGPoint(x: x, y: y + cellHeight - 1))
                     ctx.addLine(to: CGPoint(x: x + cellWidth, y: y + cellHeight - 1))
                     ctx.strokePath()
                 }
                 if attrs.strikethrough {
-                    ctx.setStrokeColor(drawColor.nsColor.cgColor)
+                    ctx.setStrokeColor(fgColor.nsColor.cgColor)
                     ctx.setLineWidth(1)
                     ctx.move(to: CGPoint(x: x, y: y + cellHeight / 2))
                     ctx.addLine(to: CGPoint(x: x + cellWidth, y: y + cellHeight / 2))
@@ -494,6 +548,8 @@ final class TerminalGridView: NSView {
     // MARK: - Keyboard
 
     override func keyDown(with event: NSEvent) {
+        Log.debug("input", "keyDown RECEIVED: characters='\(event.characters ?? "nil")' keyCode=\(event.keyCode)")
+        
         let cmd = event.modifierFlags.contains(.command)
 
         // Cmd+C → copy selection
@@ -524,10 +580,54 @@ final class TerminalGridView: NSView {
             needsDisplay = true
         }
 
+        // Handle chat command interception
         if let data = TerminalKeyMapper.data(for: event) {
+            // Check for Return key (keyCode 36)
+            if event.keyCode == 36 {
+                // Check if local buffer starts with /chat command
+                let trimmed = localLineBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.lowercased() == "/chat-exit" {
+                    localLineBuffer = ""
+                    inputHandler?.sendChatExit()
+                    return
+                }
+                if trimmed.lowercased().hasPrefix("/chat ") || trimmed.lowercased() == "/chat" {
+                    let chatContent = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    localLineBuffer = ""
+                    inputHandler?.sendChatEnter(content: chatContent)
+                    return
+                }
+                // Not a chat command, send normally and clear buffer
+                localLineBuffer = ""
+                inputHandler?.send(bytes: data)
+                return
+            }
+            
+            // Handle backspace/delete (keyCode 51)
+            if event.keyCode == 51 {
+                if !localLineBuffer.isEmpty {
+                    localLineBuffer.removeLast()
+                }
+                inputHandler?.send(bytes: data)
+                return
+            }
+            
+            // Handle escape (keyCode 53) - clear buffer
+            if event.keyCode == 53 {
+                localLineBuffer = ""
+                inputHandler?.send(bytes: data)
+                return
+            }
+            
+            // Regular character - add to buffer and send
+            if let chars = event.characters {
+                localLineBuffer.append(chars)
+            }
             inputHandler?.send(bytes: data)
             return
         }
+        
+        Log.debug("input", "keyDown: unmapped keyCode=\(event.keyCode)")
         super.keyDown(with: event)
     }
 
@@ -535,7 +635,10 @@ final class TerminalGridView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         inputHandler?.didBecomeActive()
-        window?.makeFirstResponder(self)
+        
+        // CRITICAL: Ensure terminal takes focus on click
+        let success = window?.makeFirstResponder(self) ?? false
+        Log.debug("focus", "mouseDown makeFirstResponder: \(success)")
 
         // Cmd+click: open URL under cursor (OSC 8 hyperlinks or detected URLs)
         if event.modifierFlags.contains(.command) {

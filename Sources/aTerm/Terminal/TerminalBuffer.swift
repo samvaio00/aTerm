@@ -106,6 +106,7 @@ final class TerminalBuffer {
     private(set) var cursorX: Int = 0
     private(set) var cursorY: Int = 0
     var cursorVisible: Bool = true
+    var cursorShape: CursorStyle = .block
 
     var currentAttributes: CellAttributes = .default
 
@@ -222,10 +223,21 @@ final class TerminalBuffer {
         mainScreen = Self.resizeScreen(mainScreen, oldCols: columns, oldRows: rows, newCols: newCols, newRows: newRows)
         altScreen = Self.resizeScreen(altScreen, oldCols: columns, oldRows: rows, newCols: newCols, newRows: newRows)
 
+        let oldRows = rows
         columns = newCols
         rows = newRows
-        scrollTop = 0
-        scrollBottom = newRows - 1
+        // Preserve scroll regions proportionally; reset if they spanned the full screen
+        if scrollTop == 0 && scrollBottom == oldRows - 1 {
+            scrollTop = 0
+            scrollBottom = newRows - 1
+        } else {
+            scrollTop = min(scrollTop, newRows - 1)
+            scrollBottom = min(scrollBottom, newRows - 1)
+            if scrollTop >= scrollBottom {
+                scrollTop = 0
+                scrollBottom = newRows - 1
+            }
+        }
         cursorX = min(cursorX, newCols - 1)
         cursorY = min(cursorY, newRows - 1)
         markDirty()
@@ -553,6 +565,7 @@ final class TerminalBuffer {
         mouseMode = .none
         useLineDrawingCharset = false
         cursorVisible = true
+        cursorShape = .block
         scrollTop = 0
         scrollBottom = rows - 1
         isAlternateScreen = false

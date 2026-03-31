@@ -309,6 +309,16 @@ final class WindowModel: ObservableObject, Identifiable {
                 self.appModel.refreshProviderLabel(for: tab)
             }
         }
+        
+        // Set up chat request callback for each pane
+        for pane in tab.panes {
+            pane.onChatRequest = { [weak self, weak pane] message in
+                Task { @MainActor [weak self, weak pane] in
+                    guard let self, let pane else { return }
+                    await self.appModel.answerChatQuery(message, for: pane)
+                }
+            }
+        }
     }
 
     func persistTabs() {

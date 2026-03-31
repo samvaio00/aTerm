@@ -4,11 +4,12 @@ struct ContentView: View {
     @EnvironmentObject private var appModel: AppModel
     @StateObject private var windowModel: WindowModel
     @State private var isSidebarVisible = false
-
+    @State private var sidebarWidth: CGFloat = 320
+    
     init(appModel: AppModel) {
         _windowModel = StateObject(wrappedValue: WindowModel(appModel: appModel))
     }
-
+    
     var body: some View {
         Group {
             if appModel.isOnboardingPresented {
@@ -21,63 +22,87 @@ struct ContentView: View {
         }
         .environmentObject(windowModel)
         .modifier(WindowCommandHandler(windowModel: windowModel))
+        .onAppear {
+            if #available(macOS 14.0, *) {
+                NSApp.activate()
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
     }
-
+    
     private var mainContent: some View {
         ZStack {
             WindowFrameRestorer()
                 .frame(width: 0, height: 0)
-
-            HSplitView {
+            
+            // Main layout
+            HStack(spacing: 0) {
+                // Terminal area
                 VStack(spacing: 0) {
+                    // Banner
                     if appModel.showNerdFontBanner {
                         NerdFontBanner()
+                            .transition(.move(edge: .top).combined(with: .opacity))
                     }
-
-                    WindowTabStripView(windowModel: windowModel, isSidebarVisible: $isSidebarVisible)
-
-                    Divider()
-
+                    
+                    // Modern tab strip
+                    ModernTabStrip(windowModel: windowModel, isSidebarVisible: $isSidebarVisible)
+                    
+                    SubtleDivider()
+                    
+                    // Terminal workspace
                     if let selectedTab = windowModel.selectedTab {
-                        TerminalWorkspace(tab: selectedTab)
+                        ModernTerminalWorkspace(tab: selectedTab)
                     } else {
-                        VStack(spacing: 10) {
-                            Image(systemName: "terminal")
-                                .font(.system(size: 28, weight: .medium))
-                            Text("No Tabs")
-                                .font(.system(size: 16, weight: .semibold))
-                        }
-                        .foregroundStyle(.white.opacity(0.85))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        EmptyStateView(
+                            icon: "terminal",
+                            title: "No Tabs",
+                            subtitle: "Press ⌘T to create a new tab"
+                        )
                         .background(Color.black)
                     }
                 }
-
+                
+                // Collapsible sidebar
                 if isSidebarVisible, let selectedTab = windowModel.selectedTab {
-                    AppearanceSidebarView(tab: selectedTab)
-                        .frame(minWidth: 320)
+                    ModernSidebar(tab: selectedTab)
+                        .frame(width: sidebarWidth)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
-
-            if windowModel.isModelPickerPresented {
-                ModelPickerOverlay()
-            }
-
-            if windowModel.isCommandPalettePresented {
-                CommandPaletteOverlay()
-            }
-
-            if windowModel.isAgentPickerPresented {
-                AgentPickerOverlay()
-            }
+            
+            // Overlays
+            overlayGroup
+        }
+        .animation(DesignSystem.Animation.normal, value: isSidebarVisible)
+        .animation(DesignSystem.Animation.normal, value: appModel.showNerdFontBanner)
+    }
+    
+    @ViewBuilder
+    private var overlayGroup: some View {
+        if windowModel.isModelPickerPresented {
+            ModernModelPicker()
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+        }
+        
+        if windowModel.isCommandPalettePresented {
+            ModernCommandPalette()
+                .transition(.opacity.combined(with: .move(edge: .top)))
+        }
+        
+        if windowModel.isAgentPickerPresented {
+            ModernAgentPicker()
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
         }
     }
 }
 
-/// Handles menu command notifications for the focused window (part 1: tab commands)
+// MARK: - Window Command Handler
+
 private struct WindowCommandHandler: ViewModifier {
     @ObservedObject var windowModel: WindowModel
-
+    
     func body(content: Content) -> some View {
         content
             .onAppear { windowModel.restoreOrCreateInitialTabs() }
@@ -86,16 +111,6 @@ private struct WindowCommandHandler: ViewModifier {
             .onReceive(NotificationCenter.default.publisher(for: .aTermToggleModelPicker)) { _ in windowModel.toggleModelPicker() }
             .onReceive(NotificationCenter.default.publisher(for: .aTermToggleSearch)) { _ in windowModel.toggleSearchBar() }
             .onReceive(NotificationCenter.default.publisher(for: .aTermClearScrollback)) { _ in windowModel.clearSelectedScrollback() }
-            .modifier(WindowCommandHandler2(windowModel: windowModel))
-    }
-}
-
-/// Handles menu command notifications for the focused window (part 2: split/palette/URL)
-private struct WindowCommandHandler2: ViewModifier {
-    @ObservedObject var windowModel: WindowModel
-
-    func body(content: Content) -> some View {
-        content
             .onReceive(NotificationCenter.default.publisher(for: .aTermSplitH)) { _ in windowModel.splitSelectedPane(.horizontal) }
             .onReceive(NotificationCenter.default.publisher(for: .aTermSplitV)) { _ in windowModel.splitSelectedPane(.vertical) }
             .onReceive(NotificationCenter.default.publisher(for: .aTermCommandPalette)) { _ in windowModel.isCommandPalettePresented.toggle() }
@@ -122,219 +137,208 @@ private struct WindowCommandHandler2: ViewModifier {
     }
 }
 
-/// Tab strip that uses WindowModel for per-window tabs
-private struct WindowTabStripView: View {
+// MARK: - Modern Tab Strip
+
+private struct ModernTabStrip: View {
     @EnvironmentObject private var appModel: AppModel
     @ObservedObject var windowModel: WindowModel
     @Binding var isSidebarVisible: Bool
-
-    // This string is set at compile time — check it matches your latest build
-    private static let buildStamp = "b:2026-03-23T12:50"
-
+    
+    private static let buildStamp = "b:2026-03-23"
+    
     var body: some View {
         HStack(spacing: 0) {
+            // Build stamp
             Text(Self.buildStamp)
-                .font(.system(size: 9, design: .monospaced))
+                .font(DesignSystem.Typography.mono(9))
                 .foregroundStyle(.tertiary)
-                .padding(.leading, 8)
-
-            ForEach(windowModel.tabs) { tab in
-                TabButton(tab: tab, isSelected: windowModel.selectedTabID == tab.id) {
-                    windowModel.selectTab(id: tab.id)
-                } onClose: {
-                    windowModel.closeTab(id: tab.id)
+                .padding(.leading, DesignSystem.Spacing.m)
+            
+            // Tab buttons
+            HStack(spacing: 4) {
+                ForEach(windowModel.tabs) { tab in
+                    ModernTabButton(
+                        tab: tab,
+                        isSelected: windowModel.selectedTabID == tab.id
+                    ) {
+                        windowModel.selectTab(id: tab.id)
+                    } onClose: {
+                        windowModel.closeTab(id: tab.id)
+                    }
                 }
             }
-
+            .padding(.horizontal, DesignSystem.Spacing.s)
+            
             Spacer()
-
-            Button {
-                windowModel.createTabAndSelect()
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .medium))
+            
+            // Toolbar actions
+            HStack(spacing: DesignSystem.Spacing.xs) {
+                ToolbarButton(icon: "plus", tooltip: "New Tab (⌘T)") {
+                    windowModel.createTabAndSelect()
+                }
+                
+                ToolbarButton(icon: "bolt", tooltip: "Launch Agent") {
+                    windowModel.openAgentPicker()
+                }
+                
+                ToolbarButton(
+                    icon: "sidebar.right",
+                    tooltip: "Toggle Sidebar (⌘⌥S)",
+                    isActive: isSidebarVisible
+                ) {
+                    isSidebarVisible.toggle()
+                }
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 8)
-
-            Button {
-                windowModel.openAgentPicker()
-            } label: {
-                Image(systemName: "bolt")
-                    .font(.system(size: 12, weight: .medium))
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 8)
-
-            Button {
-                isSidebarVisible.toggle()
-            } label: {
-                Image(systemName: "sidebar.right")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(isSidebarVisible ? .primary : .secondary)
-            }
-            .buttonStyle(.plain)
-            .padding(.trailing, 12)
-            .help("Toggle Sidebar")
+            .padding(.trailing, DesignSystem.Spacing.m)
         }
-        .padding(.vertical, 4)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(height: DesignSystem.Layout.tabHeight)
+        .background(DesignSystem.Colors.backgroundPrimary)
     }
 }
 
-private struct TabButton: View {
+private struct ModernTabButton: View {
     @ObservedObject var tab: TerminalTabViewModel
     let isSelected: Bool
     let onSelect: () -> Void
     let onClose: () -> Void
-
+    @State private var isHovered = false
+    
     var body: some View {
         HStack(spacing: 6) {
+            // Status indicator
             if tab.hasUnreadOutput {
                 Circle()
                     .fill(Color.accentColor)
-                    .frame(width: 6, height: 6)
+                    .frame(width: 5, height: 5)
             }
+            
+            // Agent icon
             if tab.isAgentTab {
                 Image(systemName: "bolt.fill")
-                    .font(.system(size: 10))
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.orange)
             }
+            
+            // Title
             Text(tab.title)
-                .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                .font(DesignSystem.Typography.defaultFont(12, weight: isSelected ? .semibold : .regular))
                 .lineLimit(1)
-
+            
+            // Close button
             Button(action: onClose) {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .bold))
             }
             .buttonStyle(.plain)
-            .opacity(isSelected ? 0.6 : 0)
+            .opacity(isSelected || isHovered ? 0.6 : 0)
+            .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(isSelected ? Color.white.opacity(0.08) : Color.clear)
-        .cornerRadius(6)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Radius.s, style: .continuous)
+                .fill(isSelected ? Color.white.opacity(0.06) : Color.clear)
+        )
+        .onHover { hovering in
+            withAnimation(DesignSystem.Animation.fast) {
+                isHovered = hovering
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
     }
 }
 
-private struct TerminalPane: View {
-    @EnvironmentObject private var appModel: AppModel
-    @ObservedObject var pane: TerminalPaneViewModel
-    let isActive: Bool
-    let onSelect: () -> Void
-    let onClose: (() -> Void)?
-
+private struct ToolbarButton: View {
+    let icon: String
+    let tooltip: String
+    var isActive: Bool = false
+    let action: () -> Void
+    
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(pane.title)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                Spacer()
-                Text(pane.modeIndicatorText)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Text(pane.profileName)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text("\(pane.activeProviderName) · \(pane.activeModelName)")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text(pane.statusText)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                if let onClose {
-                    Button(action: onClose) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .bold))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(Color(nsColor: .windowBackgroundColor))
-
-            Divider()
-
-            TerminalView(
-                buffer: pane.terminalBuffer,
-                appearance: pane.appearance,
-                theme: appModel.theme(for: pane.appearance.themeID),
-                searchQuery: pane.searchQuery,
-                isRegexSearchEnabled: pane.isRegexSearchEnabled,
-                searchMatches: pane.searchMatches,
-                currentSearchIndex: pane.currentSearchIndex,
-                onInput: pane.handleInput(_:),
-                onResize: pane.updateTerminalSize(columns:rows:),
-                onBecomeActive: onSelect
-            )
-            // Force NSView recreation when theme or buffer changes
-            .id("\(pane.appearance.themeID)-\(pane.id)")
-            .background(Color(appModel.theme(for: pane.appearance.themeID).palette.background.nsColor))
-
-            if pane.isSearchPresented {
-                ScrollbackSearchBar(pane: pane)
-            }
-
-            if let banner = pane.agentExitBanner {
-                AgentExitBanner(pane: pane, text: banner)
-            }
-
-            if case let .waitingForDisambiguation(input) = pane.submissionState {
-                DisambiguationBar(input: input, pane: pane)
-            }
-
-            if !pane.aiShellState.generatedCommand.isEmpty || pane.aiShellState.isGenerating {
-                AIShellCard(pane: pane)
-            }
-
-            if !pane.queryResponse.text.isEmpty || pane.queryResponse.isStreaming {
-                QueryResponseCard(pane: pane)
-            }
-
-            SmartInputBar(pane: pane)
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
         }
-        .overlay {
-            RoundedRectangle(cornerRadius: 0)
-                .strokeBorder(isActive ? Color.accentColor.opacity(0.5) : Color.clear, lineWidth: 2)
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            onSelect()
-        }
-        .task {
-            pane.startIfNeeded()
-        }
+        .buttonStyle(ToolbarButtonStyle(isActive: isActive))
+        .help(tooltip)
     }
 }
 
-private struct TerminalWorkspace: View {
-    @ObservedObject var tab: TerminalTabViewModel
-
-    var body: some View {
-        paneLayout(for: tab.panes)
+struct ToolbarButtonStyle: ButtonStyle {
+    let isActive: Bool
+    
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundColor(isActive ? .accentColor : .secondary)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(isActive ? Color.accentColor.opacity(0.1) : Color.clear)
+            )
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(configuration.isPressed ? Color.white.opacity(0.05) : Color.clear)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 5))
+            .animation(DesignSystem.Animation.fast, value: isActive)
     }
+}
 
+// MARK: - Modern Terminal Workspace
+
+private struct ModernTerminalWorkspace: View {
+    @ObservedObject var tab: TerminalTabViewModel
+    
+    var body: some View {
+        GeometryReader { geometry in
+            paneLayout(for: tab.panes, in: geometry.size)
+        }
+    }
+    
     @ViewBuilder
-    private func paneLayout(for panes: [TerminalPaneViewModel]) -> some View {
+    private func paneLayout(for panes: [TerminalPaneViewModel], in size: CGSize) -> some View {
         switch panes.count {
         case 0:
             Color.black
         case 1:
-            paneView(panes[0])
+            ModernTerminalPane(
+                pane: panes[0],
+                isActive: tab.activePaneID == panes[0].id,
+                onSelect: { tab.selectPane(id: panes[0].id) },
+                onClose: nil
+            )
         case 2:
             if tab.splitOrientation == .vertical {
                 VSplitView {
-                    paneView(panes[0])
-                    paneView(panes[1])
+                    ModernTerminalPane(
+                        pane: panes[0],
+                        isActive: tab.activePaneID == panes[0].id,
+                        onSelect: { tab.selectPane(id: panes[0].id) },
+                        onClose: { tab.closePane(id: panes[0].id) }
+                    )
+                    ModernTerminalPane(
+                        pane: panes[1],
+                        isActive: tab.activePaneID == panes[1].id,
+                        onSelect: { tab.selectPane(id: panes[1].id) },
+                        onClose: { tab.closePane(id: panes[1].id) }
+                    )
                 }
             } else {
                 HSplitView {
-                    paneView(panes[0])
-                    paneView(panes[1])
+                    ModernTerminalPane(
+                        pane: panes[0],
+                        isActive: tab.activePaneID == panes[0].id,
+                        onSelect: { tab.selectPane(id: panes[0].id) },
+                        onClose: { tab.closePane(id: panes[0].id) }
+                    )
+                    ModernTerminalPane(
+                        pane: panes[1],
+                        isActive: tab.activePaneID == panes[1].id,
+                        onSelect: { tab.selectPane(id: panes[1].id) },
+                        onClose: { tab.closePane(id: panes[1].id) }
+                    )
                 }
             }
         case 3, 4:
@@ -350,585 +354,335 @@ private struct TerminalWorkspace: View {
                 }
             }
         default:
-            paneView(panes[0])
+            ModernTerminalPane(
+                pane: panes[0],
+                isActive: tab.activePaneID == panes[0].id,
+                onSelect: { tab.selectPane(id: panes[0].id) },
+                onClose: nil
+            )
         }
     }
-
+    
     @ViewBuilder
     private func row(for panes: [TerminalPaneViewModel]) -> some View {
         HSplitView {
             ForEach(panes) { pane in
-                paneView(pane)
+                ModernTerminalPane(
+                    pane: pane,
+                    isActive: tab.activePaneID == pane.id,
+                    onSelect: { tab.selectPane(id: pane.id) },
+                    onClose: tab.panes.count > 1 ? { tab.closePane(id: pane.id) } : nil
+                )
             }
         }
     }
-
+    
     @ViewBuilder
     private func column(for panes: [TerminalPaneViewModel]) -> some View {
         VSplitView {
             ForEach(panes) { pane in
-                paneView(pane)
+                ModernTerminalPane(
+                    pane: pane,
+                    isActive: tab.activePaneID == pane.id,
+                    onSelect: { tab.selectPane(id: pane.id) },
+                    onClose: tab.panes.count > 1 ? { tab.closePane(id: pane.id) } : nil
+                )
             }
         }
     }
+}
 
-    private func paneView(_ pane: TerminalPaneViewModel) -> some View {
-        TerminalPane(
-            pane: pane,
-            isActive: tab.activePaneID == pane.id,
-            onSelect: { tab.selectPane(id: pane.id) },
-            onClose: tab.panes.count > 1 ? { tab.closePane(id: pane.id) } : nil
-        )
+// MARK: - Modern Terminal Pane
+
+private struct ModernTerminalPane: View {
+    @EnvironmentObject private var appModel: AppModel
+    @ObservedObject var pane: TerminalPaneViewModel
+    let isActive: Bool
+    let onSelect: () -> Void
+    let onClose: (() -> Void)?
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Modern header
+            ModernPaneHeader(pane: pane, isActive: isActive, onClose: onClose)
+            
+            SubtleDivider()
+            
+            // Terminal view with padding to prevent cursor/prompt being hidden at edges
+            TerminalView(
+                buffer: pane.terminalBuffer,
+                appearance: pane.appearance,
+                theme: appModel.theme(for: pane.appearance.themeID),
+                searchQuery: pane.searchQuery,
+                isRegexSearchEnabled: pane.isRegexSearchEnabled,
+                searchMatches: pane.searchMatches,
+                currentSearchIndex: pane.currentSearchIndex,
+                onInput: pane.handleInput(_:),
+                onResize: pane.updateTerminalSize(columns:rows:),
+                onBecomeActive: onSelect,
+                onChatExit: {
+                    pane.exitChatMode()
+                },
+                onChatEnter: { content in
+                    pane.enterChatMode(providerID: pane.appearance.chatProvider, modelID: pane.appearance.chatModel)
+                    if !content.isEmpty {
+                        Task { @MainActor in
+                            await appModel.answerChatQuery(content, for: pane)
+                        }
+                    }
+                }
+            )
+            .id("\(pane.appearance.themeID)-\(pane.id)")
+            .background(Color(appModel.theme(for: pane.appearance.themeID).palette.background.nsColor))
+            .padding(.vertical, 4)
+            
+            // Search bar
+            if pane.isSearchPresented {
+                ModernSearchBar(pane: pane)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            
+            // Agent exit banner
+            if let banner = pane.agentExitBanner {
+                ModernAgentExitBanner(pane: pane, text: banner)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            
+            // AI cards stack (floating overlay)
+            VStack(spacing: 0) {
+                if case let .waitingForDisambiguation(input) = pane.submissionState {
+                    ModernDisambiguationBar(input: input, pane: pane)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                
+                if !pane.aiShellState.generatedCommand.isEmpty || pane.aiShellState.isGenerating {
+                    ModernAIShellCard(pane: pane)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                
+                if !pane.queryResponse.text.isEmpty || pane.queryResponse.isStreaming {
+                    ModernQueryResponseCard(pane: pane)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .padding(.bottom, pane.isAlternateScreen ? 0 : DesignSystem.Spacing.m)
+        }
+        .background(DesignSystem.Colors.terminalBackground)
+        .overlay {
+            RoundedRectangle(cornerRadius: 0)
+                .strokeBorder(isActive ? DesignSystem.Colors.paneBorderActive : DesignSystem.Colors.paneBorder, lineWidth: isActive ? 1.5 : 0.5)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onSelect()
+        }
+        .task { pane.startIfNeeded() }
+        .animation(DesignSystem.Animation.normal, value: pane.isSearchPresented)
+        .animation(DesignSystem.Animation.normal, value: pane.agentExitBanner != nil)
+        .animation(DesignSystem.Animation.normal, value: pane.submissionState.isWaiting)
+        .animation(DesignSystem.Animation.normal, value: pane.aiShellState.isGenerating)
+        .animation(DesignSystem.Animation.normal, value: pane.queryResponse.isStreaming)
+        .onAppear {
+            // Ensure terminal takes focus immediately in traditional mode
+            DispatchQueue.main.async {
+                NSApp.keyWindow?.makeFirstResponder(nil)
+            }
+        }
     }
 }
 
-private struct ScrollbackSearchBar: View {
-    @ObservedObject var pane: TerminalPaneViewModel
+// MARK: - Modern Pane Header
 
+private struct ModernPaneHeader: View {
+    @ObservedObject var pane: TerminalPaneViewModel
+    let isActive: Bool
+    let onClose: (() -> Void)?
+    
     var body: some View {
-        HStack(spacing: 10) {
-            TextField("Find in scrollback", text: $pane.searchQuery)
-                .textFieldStyle(.roundedBorder)
-                .onChange(of: pane.searchQuery) { _ in
-                    pane.refreshSearch()
+        HStack(spacing: DesignSystem.Spacing.m) {
+            // Title section
+            HStack(spacing: 6) {
+                Text(pane.title)
+                    .font(DesignSystem.Typography.defaultFont(12, weight: .semibold))
+                
+                if pane.isAgentTab {
+                    Tag(text: "AGENT", color: .orange)
                 }
+            }
+            
+            Spacer()
+            
+            // Info section
+            HStack(spacing: DesignSystem.Spacing.m) {
+                // Mode indicator
+                HStack(spacing: 4) {
+                    modeIcon
+                    Text(pane.modeIndicatorText)
+                        .font(DesignSystem.Typography.mono(10))
+                }
+                .foregroundStyle(.secondary)
+                
+                // Provider info
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 9))
+                    Text("\(pane.activeProviderName)")
+                        .font(DesignSystem.Typography.defaultFont(10))
+                }
+                .foregroundStyle(.tertiary)
+                
+                // Close button
+                if let onClose = onClose {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .buttonStyle(IconButtonStyle(isActive: false))
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, DesignSystem.Spacing.m)
+        .padding(.vertical, 8)
+        .background(DesignSystem.Colors.backgroundPrimary)
+    }
+    
+    private var modeIcon: some View {
+        let icon: String
+        let color: Color
+        
+        switch pane.modeIndicatorText {
+        case InputMode.aiToShell.rawValue:
+            icon = "bolt.fill"
+            color = .yellow
+        case InputMode.query.rawValue:
+            icon = "questionmark.circle.fill"
+            color = .blue
+        default:
+            icon = "dollarsign.circle.fill"
+            color = .green
+        }
+        
+        return Image(systemName: icon)
+            .font(.system(size: 10))
+            .foregroundColor(color)
+    }
+}
+
+// MARK: - Components
+
+private struct ModernSearchBar: View {
+    @ObservedObject var pane: TerminalPaneViewModel
+    
+    var body: some View {
+        HStack(spacing: DesignSystem.Spacing.m) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                
+                TextField("Find in scrollback", text: $pane.searchQuery)
+                    .textFieldStyle(ModernTextFieldStyle())
+                    .onChange(of: pane.searchQuery) { _ in pane.refreshSearch() }
+            }
+            
             Toggle("Regex", isOn: $pane.isRegexSearchEnabled)
                 .toggleStyle(.checkbox)
-                .font(.system(size: 11))
-                .onChange(of: pane.isRegexSearchEnabled) { _ in
-                    pane.refreshSearch()
-                }
-            Text(pane.searchMatchCount == 0 ? "0 matches" : "\(pane.currentSearchIndex + 1) of \(pane.searchMatchCount)")
-                .font(.system(size: 11, design: .monospaced))
+                .font(DesignSystem.Typography.defaultFont(11))
+                .onChange(of: pane.isRegexSearchEnabled) { _ in pane.refreshSearch() }
+            
+            Text(matchText)
+                .font(DesignSystem.Typography.mono(10))
                 .foregroundStyle(.secondary)
-            Button("Prev") {
-                pane.previousSearchMatch()
+            
+            HStack(spacing: DesignSystem.Spacing.xs) {
+                Button("◀") { pane.previousSearchMatch() }
+                Button("▶") { pane.nextSearchMatch() }
             }
-            Button("Next") {
-                pane.nextSearchMatch()
-            }
-            Button("Close") {
-                pane.isSearchPresented = false
-            }
+            .font(DesignSystem.Typography.defaultFont(10))
+            
+            Button("Close") { pane.isSearchPresented = false }
+                .font(DesignSystem.Typography.defaultFont(10))
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, DesignSystem.Spacing.m)
         .padding(.vertical, 10)
-        .background(.regularMaterial)
+        .background(.ultraThinMaterial)
+    }
+    
+    private var matchText: String {
+        if pane.searchMatchCount == 0 {
+            return "No matches"
+        }
+        return "\(pane.currentSearchIndex + 1) / \(pane.searchMatchCount)"
     }
 }
 
-private struct AgentExitBanner: View {
+private struct ModernAgentExitBanner: View {
     @EnvironmentObject private var windowModel: WindowModel
     @ObservedObject var pane: TerminalPaneViewModel
     let text: String
-
+    
     var body: some View {
-        HStack {
-            Text(text)
-                .font(.system(size: 12, weight: .medium))
+        HStack(spacing: DesignSystem.Spacing.m) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(text)
+                    .font(DesignSystem.Typography.defaultFont(12))
+            }
+            
             Spacer()
-            Toggle("Auto-restart", isOn: $pane.isAgentAutoRestartEnabled)
-                .toggleStyle(.checkbox)
-                .font(.system(size: 11))
-            Button("Restart") {
-                windowModel.restartAgentPane(pane)
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Color.orange.opacity(0.12))
-    }
-}
-
-private struct SmartInputBar: View {
-    @EnvironmentObject private var windowModel: WindowModel
-    @ObservedObject var pane: TerminalPaneViewModel
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(inputPrefix)
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.secondary)
-
-            TextField("Enter a command, natural language request, or question", text: $pane.inputText, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13, design: .monospaced))
-                .onSubmit {
-                    windowModel.submitInput(for: pane)
-                }
-
-            Button("Send") {
-                windowModel.submitInput(for: pane)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .background(.ultraThinMaterial)
-    }
-
-    private var inputPrefix: String {
-        switch pane.modeIndicatorText {
-        case InputMode.aiToShell.rawValue:
-            return "⚡"
-        case InputMode.query.rawValue:
-            return "?"
-        default:
-            return "$"
-        }
-    }
-}
-
-private struct AIShellCard: View {
-    @EnvironmentObject private var windowModel: WindowModel
-    @ObservedObject var pane: TerminalPaneViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("⚡ Generated command")
-                    .font(.system(size: 12, weight: .semibold))
-                Spacer()
-                Button {
-                    pane.aiShellState = AIShellState()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Dismiss (Esc)")
-            }
-
-            if pane.aiShellState.isGenerating {
-                ProgressView()
-                    .controlSize(.small)
-            } else if pane.aiShellState.isEditing {
-                TextField("Generated command", text: $pane.aiShellState.generatedCommand, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
-            } else {
-                Text(pane.aiShellState.generatedCommand)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
-
-            HStack {
-                Button(pane.aiShellState.isEditing ? "Done" : "Edit") {
-                    pane.aiShellState.isEditing.toggle()
-                }
-                .disabled(pane.aiShellState.isGenerating)
-
-                Spacer()
-
-                Button("Run ↵") {
-                    windowModel.runGeneratedCommand(for: pane)
+            
+            HStack(spacing: DesignSystem.Spacing.m) {
+                Toggle("Auto-restart", isOn: $pane.isAgentAutoRestartEnabled)
+                    .toggleStyle(.checkbox)
+                    .font(DesignSystem.Typography.defaultFont(11))
+                
+                Button("Restart") {
+                    windowModel.restartAgentPane(pane)
                 }
                 .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.return, modifiers: [])
-                .disabled(pane.aiShellState.isGenerating || pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .controlSize(.small)
             }
         }
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .padding(.horizontal, 14)
-        .padding(.top, 12)
-        .onExitCommand {
-            pane.aiShellState = AIShellState()
-        }
-    }
-}
-
-private struct QueryResponseCard: View {
-    @EnvironmentObject private var windowModel: WindowModel
-    @ObservedObject var pane: TerminalPaneViewModel
-    @State private var isCollapsed = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("?")
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                Text(pane.queryResponse.isStreaming ? "Streaming answer..." : "Answer")
-                    .font(.system(size: 12, weight: .semibold))
-                Spacer()
-                if !pane.queryResponse.isStreaming {
-                    Button {
-                        isCollapsed.toggle()
-                    } label: {
-                        Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(isCollapsed ? "Expand" : "Collapse")
-
-                    Button {
-                        pane.queryResponse = QueryResponseState()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Dismiss")
-                }
-            }
-
-            if !isCollapsed {
-                ScrollView {
-                    Text(pane.queryResponse.text)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .font(.system(size: 12))
-                        .textSelection(.enabled)
-                }
-                .frame(maxHeight: 180)
-
-                if !pane.queryResponse.suggestions.isEmpty {
-                    ForEach(pane.queryResponse.suggestions) { suggestion in
-                        HStack {
-                            Text(suggestion.command)
-                                .font(.system(size: 11, design: .monospaced))
-                                .lineLimit(2)
-                            Spacer()
-                            Button("Run") {
-                                windowModel.runQuerySuggestion(suggestion, for: pane)
-                            }
-                        }
-                        .padding(8)
-                        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    }
-                }
-            }
-        }
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .padding(.horizontal, 14)
-        .padding(.top, 12)
-    }
-}
-
-private struct DisambiguationBar: View {
-    @EnvironmentObject private var windowModel: WindowModel
-    let input: String
-    @ObservedObject var pane: TerminalPaneViewModel
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Text("Did you mean:")
-                .font(.system(size: 12, weight: .medium))
-            Button("Run as shell command") {
-                windowModel.resolveDisambiguation(as: .terminal, for: pane)
-            }
-            Button("Answer as query") {
-                windowModel.resolveDisambiguation(as: .query, for: pane)
-            }
-            Button("Generate shell command") {
-                windowModel.resolveDisambiguation(as: .aiToShell, for: pane)
-            }
-            Spacer()
-            Text(input)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, DesignSystem.Spacing.m)
         .padding(.vertical, 10)
-        .background(.regularMaterial)
+        .background(Color.orange.opacity(0.1))
     }
 }
 
 private struct NerdFontBanner: View {
     @EnvironmentObject private var appModel: AppModel
-
+    
     var body: some View {
-        HStack(spacing: 12) {
-            Text("Nerd Font recommended for Powerlevel10k and oh-my-zsh glyphs.")
-                .font(.system(size: 12, weight: .medium))
+        HStack(spacing: DesignSystem.Spacing.m) {
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                    .foregroundStyle(.yellow)
+                Text("Nerd Font recommended for Powerlevel10k and oh-my-zsh glyphs")
+                    .font(DesignSystem.Typography.defaultFont(12))
+            }
+            
             Spacer()
+            
             Button("Dismiss") {
                 appModel.dismissNerdFontBanner()
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
+            .buttonStyle(ModernButtonStyle(variant: .secondary, size: .s))
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, DesignSystem.Spacing.m)
         .padding(.vertical, 10)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(DesignSystem.Colors.backgroundSecondary)
     }
 }
 
-private struct ModelPickerOverlay: View {
-    @EnvironmentObject private var appModel: AppModel
-    @EnvironmentObject private var windowModel: WindowModel
-    @State private var query = ""
+// MARK: - Sidebar
 
-    var filteredItems: [(provider: ModelProvider, model: ModelDefinition)] {
-        guard !query.isEmpty else { return appModel.modelPickerItems }
-        return appModel.modelPickerItems.filter {
-            $0.provider.name.localizedCaseInsensitiveContains(query) ||
-            $0.model.name.localizedCaseInsensitiveContains(query) ||
-            $0.model.id.localizedCaseInsensitiveContains(query)
-        }
-    }
-
+private struct ModernSidebar: View {
+    @ObservedObject var tab: TerminalTabViewModel
+    
     var body: some View {
-        VStack {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text("Model Picker")
-                        .font(.headline)
-                    Spacer()
-                    Button("Close") {
-                        windowModel.dismissModelPicker()
-                    }
-                }
-
-                TextField("Search providers and models", text: $query)
-                    .textFieldStyle(.roundedBorder)
-
-                ScrollView {
-                    VStack(spacing: 8) {
-                        ForEach(filteredItems, id: \.model.id) { item in
-                            Button {
-                                windowModel.assignModel(providerID: item.provider.id, modelID: item.model.id)
-                                windowModel.dismissModelPicker()
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.model.name)
-                                            .font(.system(size: 13, weight: .semibold))
-                                        Text("\(item.provider.name) · \(item.model.id)")
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                }
-                                .padding(10)
-                                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-                .frame(maxHeight: 360)
-            }
-            .padding(18)
-            .frame(width: 520)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.35).ignoresSafeArea())
-        .onTapGesture {
-            windowModel.dismissModelPicker()
-        }
-    }
-}
-
-private struct AgentPickerOverlay: View {
-    @EnvironmentObject private var appModel: AppModel
-    @EnvironmentObject private var windowModel: WindowModel
-    @State private var draftAgent = AgentDraft()
-
-    var body: some View {
-        VStack {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Text("Agents")
-                        .font(.headline)
-                    Spacer()
-                    Button("Close") {
-                        windowModel.closeAgentPicker()
-                    }
-                }
-
-                ScrollView {
-                    VStack(spacing: 8) {
-                        ForEach(appModel.availableAgents) { agent in
-                            let status = appModel.agentStatuses[agent.id]
-                            HStack {
-                                Circle()
-                                    .fill((status?.isInstalled ?? false) ? Color.green : Color.gray)
-                                    .frame(width: 8, height: 8)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(agent.name)
-                                        .font(.system(size: 13, weight: .semibold))
-                                    Text((status?.isInstalled ?? false) ? (status?.executablePath ?? agent.command) : agent.installHint)
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                }
-                                Spacer()
-                                Button((status?.isInstalled ?? false) ? "Launch" : "Unavailable") {
-                                    windowModel.launchAgent(agent)
-                                }
-                                .disabled(!(status?.isInstalled ?? false))
-                            }
-                            .padding(10)
-                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        }
-                    }
-                }
-                .frame(maxHeight: 260)
-
-                Divider()
-
-                Text("Add Custom Agent")
-                    .font(.system(size: 12, weight: .semibold))
-                TextField("ID", text: $draftAgent.id)
-                TextField("Name", text: $draftAgent.name)
-                TextField("Command", text: $draftAgent.command)
-                TextField("Auth Env Var", text: $draftAgent.authEnvVar)
-                TextField("Install Hint", text: $draftAgent.installHint)
-                TextField("Args (space separated)", text: $draftAgent.args)
-
-                HStack {
-                    Button("Save Agent") {
-                        appModel.upsertAgent(draftAgent.toDefinition())
-                        draftAgent = AgentDraft()
-                    }
-                    .disabled(draftAgent.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draftAgent.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    Spacer()
-                }
-            }
-            .padding(18)
-            .frame(width: 560)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.35).ignoresSafeArea())
-        .onTapGesture {
-            windowModel.closeAgentPicker()
-        }
-    }
-}
-
-private struct CommandPaletteOverlay: View {
-    @EnvironmentObject private var appModel: AppModel
-    @EnvironmentObject private var windowModel: WindowModel
-    @State private var query = ""
-
-    private struct PaletteAction: Identifiable {
-        let id: String
-        let label: String
-        let icon: String
-        let action: () -> Void
-    }
-
-    private var actions: [PaletteAction] {
-        let all: [PaletteAction] = [
-            .init(id: "new-tab", label: "New Tab", icon: "plus.square") { windowModel.createTabAndSelect(); dismiss() },
-            .init(id: "close-tab", label: "Close Tab", icon: "xmark.square") { windowModel.closeSelectedTab(); dismiss() },
-            .init(id: "model-picker", label: "Switch Model", icon: "brain") { dismiss(); windowModel.toggleModelPicker() },
-            .init(id: "agent-picker", label: "Launch Agent", icon: "bolt") { dismiss(); windowModel.openAgentPicker() },
-            .init(id: "find", label: "Find in Scrollback", icon: "magnifyingglass") { windowModel.toggleSearchBar(); dismiss() },
-            .init(id: "clear", label: "Clear Scrollback", icon: "trash") { windowModel.clearSelectedScrollback(); dismiss() },
-            .init(id: "split-h", label: "Split Horizontally", icon: "rectangle.split.2x1") { windowModel.splitSelectedPane(.horizontal); dismiss() },
-            .init(id: "split-v", label: "Split Vertically", icon: "rectangle.split.1x2") { windowModel.splitSelectedPane(.vertical); dismiss() },
-            .init(id: "shell-integration", label: "Install Shell Integration", icon: "terminal") { appModel.installShellIntegration(); dismiss() },
-        ]
-        // Add theme switching actions
-        + appModel.allThemes.map { theme in
-            PaletteAction(id: "theme-\(theme.id)", label: "Theme: \(theme.name)", icon: "paintbrush") {
-                windowModel.applyTheme(theme)
-                dismiss()
-            }
-        }
-        // Add agent launch actions
-        + appModel.availableAgents.filter { appModel.agentStatuses[$0.id]?.isInstalled == true }.map { agent in
-            PaletteAction(id: "agent-\(agent.id)", label: "Launch \(agent.name)", icon: "bolt.circle") {
-                windowModel.launchAgent(agent)
-                dismiss()
-            }
-        }
-
-        if query.isEmpty { return all }
-        let q = query.lowercased()
-        return all.filter { $0.label.lowercased().contains(q) }
-    }
-
-    private func dismiss() {
-        windowModel.isCommandPalettePresented = false
-    }
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.3).ignoresSafeArea()
-                .onTapGesture { dismiss() }
-
-            VStack(spacing: 0) {
-                HStack {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    TextField("Type a command...", text: $query)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 15))
-                        .onSubmit {
-                            if let first = actions.first { first.action() }
-                        }
-                }
-                .padding(12)
-
-                Divider()
-
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(actions) { action in
-                            Button {
-                                action.action()
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Image(systemName: action.icon)
-                                        .frame(width: 20)
-                                        .foregroundStyle(.secondary)
-                                    Text(action.label)
-                                    Spacer()
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .background(Color.primary.opacity(0.001)) // hit target
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-                .frame(maxHeight: 320)
-            }
-            .frame(width: 480)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .shadow(color: .black.opacity(0.25), radius: 20, y: 8)
-            .padding(.top, 60)
-            .frame(maxHeight: .infinity, alignment: .top)
-        }
-        .onExitCommand { dismiss() }
-    }
-}
-
-private struct AgentDraft {
-    var id = ""
-    var name = ""
-    var command = ""
-    var authEnvVar = ""
-    var installHint = ""
-    var args = ""
-
-    func toDefinition() -> AgentDefinition {
-        AgentDefinition(
-            id: id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            command: command.trimmingCharacters(in: .whitespacesAndNewlines),
-            args: args.split(whereSeparator: \.isWhitespace).map(String.init),
-            authEnvVar: authEnvVar.trimmingCharacters(in: .whitespacesAndNewlines),
-            installCheck: "which \(command.trimmingCharacters(in: .whitespacesAndNewlines))",
-            installHint: installHint.trimmingCharacters(in: .whitespacesAndNewlines),
-            protocolType: .interactiveCLI,
-            isBuiltin: false
-        )
+        AppearanceSidebarView(tab: tab)
+            .background(DesignSystem.Colors.backgroundSecondary)
     }
 }

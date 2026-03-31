@@ -14,6 +14,8 @@ struct AppearanceSidebarView: View {
     @State private var quickKeySaved = false
     @State private var draftMCPServer = MCPDraft()
     @State private var selectedProviderID: String = ""
+    @State private var isFetchingModels = false
+    @State private var fetchModelsError: String?
 
     private var availableFonts: [String] {
         FontSupport.monospaceFontNames()
@@ -194,6 +196,28 @@ struct AppearanceSidebarView: View {
 
             Divider()
 
+            // Chat Model Selection
+            Text("Chat Mode Model")
+                .font(.system(size: 12, weight: .semibold))
+            
+            Picker("Chat Provider", selection: chatProviderBinding) {
+                Text("Same as Default").tag("")
+                ForEach(appModel.availableProviders) { provider in
+                    Text(provider.name).tag(provider.id)
+                }
+            }
+            
+            Picker("Chat Model", selection: chatModelBinding) {
+                Text("Same as Default").tag("")
+                ForEach(currentChatProvider?.models ?? [], id: \.id) { model in
+                    Text(model.name.isEmpty ? model.id : model.name).tag(model.id)
+                }
+            }
+            .id("chat-model-picker-\(tab.appearance.chatProvider ?? "")")
+            .disabled(tab.appearance.chatProvider?.isEmpty ?? true)
+
+            Divider()
+
             Text("Add or Update Provider")
                 .font(.system(size: 12, weight: .semibold))
 
@@ -234,12 +258,29 @@ struct AppearanceSidebarView: View {
                     .buttonStyle(.plain)
                 }
             }
+            
+            // Fetch models button
+            if draftProvider.apiFormat == .openAICompatible || draftProvider.apiFormat == .custom {
+                Button("Fetch Models") {
+                    fetchModelsForDraftProvider()
+                }
+                .disabled(draftProvider.endpoint.isEmpty || isFetchingModels)
+                
+                if isFetchingModels {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if let fetchModelsError {
+                    Text(fetchModelsError)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                }
+            }
 
             HStack {
                 Button(isSavingProvider ? "Saving..." : "Save Provider") {
                     saveDraftProvider()
                 }
-                .disabled(isSavingProvider || draftProvider.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(isSavingProvider || (draftProvider.id.isEmpty && draftProvider.name.isEmpty))
 
                 if let selectedProvider, !selectedProvider.isBuiltin {
                     Button("Delete") {
@@ -390,6 +431,8 @@ struct AppearanceSidebarView: View {
         }
     }
 
+    // MARK: - Bindings
+
     private var activeProfileBinding: Binding<UUID> {
         Binding(
             get: { tab.profileID ?? appModel.profiles.first?.id ?? UUID() },
@@ -478,6 +521,31 @@ struct AppearanceSidebarView: View {
         )
     }
 
+    private var chatProviderBinding: Binding<String> {
+        Binding(
+            get: { tab.appearance.chatProvider ?? "" },
+            set: { value in
+                mutateAppearance { 
+                    $0.chatProvider = value.isEmpty ? nil : value
+                    $0.chatModel = nil // Reset model when provider changes
+                }
+            }
+        )
+    }
+
+    private var chatModelBinding: Binding<String> {
+        Binding(
+            get: { tab.appearance.chatModel ?? "" },
+            set: { value in
+                mutateAppearance { $0.chatModel = value.isEmpty ? nil : value }
+            }
+        )
+    }
+
+    private var currentChatProvider: ModelProvider? {
+        appModel.provider(for: tab.appearance.chatProvider)
+    }
+
     private var selectedProvider: ModelProvider? {
         appModel.provider(for: tab.appearance.aiProvider)
     }
@@ -491,6 +559,13 @@ struct AppearanceSidebarView: View {
         update(&appearance)
         tab.appearance = appearance
         tab.markStateChanged()
+        
+        // Persist changes to the active profile
+        if let profileID = tab.profileID,
+           let profileIndex = appModel.profiles.firstIndex(where: { $0.id == profileID }) {
+            appModel.profiles[profileIndex].appearance = appearance
+            appModel.persistProfilesPublic()
+        }
     }
 
     private func saveDraftProvider() {
@@ -504,6 +579,32 @@ struct AppearanceSidebarView: View {
             appModel.providerStatusMessage = error.localizedDescription
         }
     }
+    
+    private func fetchModelsForDraftProvider() {
+        guard !draftProvider.endpoint.isEmpty else { return }
+        isFetchingModels = true
+        fetchModelsError = nil
+        
+        Task {
+            do {
+                let router = ProviderRouter()
+                let apiKey = draftProvider.authType == .none ? nil : draftProvider.secret
+                let fetched = try await router.fetchModels(endpoint: draftProvider.endpoint, apiKey: apiKey)
+                await MainActor.run {
+                    // Merge fetched models with existing ones (avoid duplicates)
+                    let existingIDs = Set(draftProvider.models.map(\.id))
+                    let newModels = fetched.filter { !existingIDs.contains($0.id) }
+                    draftProvider.models.append(contentsOf: newModels)
+                    isFetchingModels = false
+                }
+            } catch {
+                await MainActor.run {
+                    fetchModelsError = "Failed"
+                    isFetchingModels = false
+                }
+            }
+        }
+    }
 
     private func statusColor(_ status: MCPServerStatus) -> Color {
         switch status {
@@ -511,194 +612,5 @@ struct AppearanceSidebarView: View {
         case .error: return .red
         case .stopped: return .gray
         }
-    }
-}
-
-private struct ProviderDraft {
-    var id = ""
-    var name = ""
-    var endpoint = ""
-    var authType: AuthType = .bearer
-    var apiFormat: APIFormat = .openAICompatible
-    var secret = ""
-    var modelID = ""
-    var modelName = ""
-    var models: [ModelDefinition] = []
-
-    mutating func addModel() {
-        let trimmedID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedID.isEmpty else { return }
-        models.append(.init(id: trimmedID, name: modelName, contextWindow: 128_000, supportsStreaming: true))
-        modelID = ""
-        modelName = ""
-    }
-
-    func toProvider() -> ModelProvider {
-        ModelProvider(
-            id: id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            endpoint: endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
-            authType: authType,
-            apiFormat: apiFormat,
-            models: models,
-            customHeaders: [:],
-            isBuiltin: false
-        )
-    }
-}
-
-private struct MCPDraft {
-    var id = ""
-    var name = ""
-    var endpoint = ""
-    var autoStart = false
-    var scope: MCPScope = .global
-
-    func toDefinition() -> MCPServerDefinition {
-        MCPServerDefinition(
-            id: id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            transport: .sse,
-            command: nil,
-            args: [],
-            endpoint: endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
-            autoStart: autoStart,
-            scope: scope,
-            isBuiltin: false
-        )
-    }
-}
-
-private struct ThemeCard: View {
-    let theme: TerminalTheme
-    let isSelected: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(theme.palette.background.nsColor))
-                .overlay(alignment: .topLeading) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("$ git status")
-                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                        Text("clean")
-                            .font(.system(size: 8, weight: .regular, design: .monospaced))
-                            .foregroundStyle(Color(theme.palette.ansi[10].nsColor))
-                    }
-                    .foregroundStyle(Color(theme.palette.foreground.nsColor))
-                    .padding(8)
-                }
-                .frame(height: 72)
-
-            Text(theme.name)
-                .font(.system(size: 11, weight: .semibold))
-        }
-        .padding(8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(isSelected ? Color.accentColor : Color.white.opacity(0.06), lineWidth: 1)
-        }
-    }
-}
-
-private struct ThemeCatalogSheet: View {
-    @EnvironmentObject private var appModel: AppModel
-    @StateObject private var catalog = ThemeCatalog()
-    @State private var searchText = ""
-    @State private var downloadingID: String?
-    @Environment(\.dismiss) private var dismiss
-
-    private var filteredEntries: [ThemeCatalog.CatalogEntry] {
-        if searchText.isEmpty { return catalog.entries }
-        return catalog.entries.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Theme Catalog")
-                    .font(.headline)
-                Spacer()
-                Button("Done") { dismiss() }
-            }
-            .padding()
-
-            TextField("Search themes...", text: $searchText)
-                .textFieldStyle(.roundedBorder)
-                .padding(.horizontal)
-
-            if catalog.isLoading {
-                Spacer()
-                ProgressView("Loading catalog...")
-                Spacer()
-            } else if let error = catalog.errorMessage {
-                Spacer()
-                Text(error)
-                    .foregroundStyle(.red)
-                    .padding()
-                Spacer()
-            } else {
-                List(filteredEntries) { entry in
-                    HStack {
-                        Text(entry.name)
-                        Spacer()
-                        if entry.isDownloaded {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                        } else if downloadingID == entry.id {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Button("Download") {
-                                downloadingID = entry.id
-                                Task {
-                                    do {
-                                        let url = try await catalog.download(entry)
-                                        try appModel.importTheme(from: url)
-                                    } catch {
-                                        // Theme download/import failed silently
-                                    }
-                                    downloadingID = nil
-                                }
-                            }
-                            .controlSize(.small)
-                        }
-                    }
-                }
-            }
-        }
-        .frame(width: 480, height: 520)
-        .task {
-            let existingIDs = Set(appModel.allThemes.map(\.id))
-            await catalog.fetchIndex(existingThemeIDs: existingIDs)
-        }
-    }
-}
-
-private struct LabeledSlider: View {
-    let title: String
-    @Binding var value: Double
-    let range: ClosedRange<Double>
-    var step: Double = 0.01
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(title)
-                Spacer()
-                Text(formattedValue)
-                    .foregroundStyle(.secondary)
-            }
-            Slider(value: $value, in: range, step: step)
-        }
-        .font(.system(size: 12, weight: .medium))
-    }
-
-    private var formattedValue: String {
-        if step >= 1 {
-            return String(Int(value.rounded()))
-        }
-        return String(format: "%.2f", value)
     }
 }

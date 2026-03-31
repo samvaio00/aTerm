@@ -94,19 +94,21 @@ struct TerminalAppearance: Codable, Hashable {
     var aiProvider: String?
     var aiModel: String?
     var classifierModel: String?
+    var chatProvider: String?
+    var chatModel: String?
 
     static let `default` = TerminalAppearance(
-        themeID: "custom-default",
+        themeID: "modern",
         fontName: "SF Mono",
         nonASCIIFontName: "SF Mono",
-        fontSize: 13,
-        lineHeight: 1.18,
-        letterSpacing: 0,
-        opacity: 0.96,
-        blur: 0.45,
+        fontSize: 18,
+        lineHeight: 1.25,
+        letterSpacing: 0.5,
+        opacity: 1.0,
+        blur: 0,
         padding: TerminalPadding(),
-        cursorStyle: .bar,
-        cursorBlink: false,
+        cursorStyle: .block,
+        cursorBlink: true,
         scrollbackSize: 10_000,
         shellPath: nil,
         zshrcPath: nil,
@@ -114,7 +116,9 @@ struct TerminalAppearance: Codable, Hashable {
         defaultWorkingDirectoryPath: nil,
         aiProvider: nil,
         aiModel: nil,
-        classifierModel: nil
+        classifierModel: nil,
+        chatProvider: nil,
+        chatModel: nil
     )
 }
 

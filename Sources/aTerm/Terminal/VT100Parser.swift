@@ -311,8 +311,30 @@ final class VT100Parser {
         case "s": buffer.saveCursor()           // SCP
         case "u": buffer.restoreCursor()        // RCP
         case "t": break                          // window manipulation (ignore)
-        case "c": break                          // DA (ignore)
-        case "q": break                          // DECSCUSR cursor style (ignore for now)
+        case "c": // DA - device attributes
+            if intermediateChars.contains(">") {
+                // Secondary DA (CSI > c): report as VT220-like terminal
+                // Pp=1 (VT220), Pv=10 (firmware version), Pc=0 (ROM cartridge)
+                sendToPTY?(Data("\u{1B}[>1;10;0c".utf8))
+            } else if intermediateChars.contains("=") {
+                // Tertiary DA (CSI = c): ignore
+                break
+            } else {
+                // Primary DA (CSI c or CSI 0 c): report as VT220 with ANSI color, etc.
+                // 62 = VT220, 1 = 132 cols, 4 = Sixel, 6 = selective erase, 22 = ANSI color
+                sendToPTY?(Data("\u{1B}[?62;1;2;4;6;22c".utf8))
+            }
+        case "q": // DECSCUSR - cursor style
+            let style = p0
+            switch style {
+            case 0, 1: buffer.cursorShape = .block       // blinking block (or default)
+            case 2:    buffer.cursorShape = .block        // steady block
+            case 3:    buffer.cursorShape = .underline    // blinking underline
+            case 4:    buffer.cursorShape = .underline    // steady underline
+            case 5:    buffer.cursorShape = .bar          // blinking bar
+            case 6:    buffer.cursorShape = .bar          // steady bar
+            default: break
+            }
         default: break
         }
     }

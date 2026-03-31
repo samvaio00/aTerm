@@ -522,4 +522,54 @@ struct ProviderRouter {
         default: return provider.models.first?.id ?? ""
         }
     }
+
+    // MARK: - Fetch Available Models
+
+    /// Fetches available models from an OpenAI-compatible /models endpoint
+    func fetchModels(endpoint: String, apiKey: String?) async throws -> [ModelDefinition] {
+        guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw ProviderRouterError.invalidEndpoint
+        }
+        
+        // Construct the models endpoint URL
+        let modelsURL: URL
+        if endpoint.hasSuffix("/chat/completions") {
+            modelsURL = url.deletingLastPathComponent().appendingPathComponent("models")
+        } else if endpoint.hasSuffix("/") {
+            modelsURL = url.appendingPathComponent("models")
+        } else {
+            modelsURL = url.appendingPathComponent("models")
+        }
+        
+        var request = URLRequest(url: modelsURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        
+        if let apiKey = apiKey, !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw ProviderRouterError.unexpectedResponse
+        }
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let modelsArray = json["data"] as? [[String: Any]] else {
+            throw ProviderRouterError.unexpectedResponse
+        }
+        
+        return modelsArray.compactMap { modelDict -> ModelDefinition? in
+            guard let id = modelDict["id"] as? String else { return nil }
+            let name = modelDict["name"] as? String ?? id
+            return ModelDefinition(
+                id: id,
+                name: name,
+                contextWindow: 128_000,
+                supportsStreaming: true
+            )
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
 }
