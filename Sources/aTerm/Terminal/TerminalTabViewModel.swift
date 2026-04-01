@@ -480,6 +480,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     private func appendSystemNoticeToBuffer(_ text: String) {
+        terminalBuffer.resetCurrentAttributesToDefault()
         for ch in text {
             if ch == "\r" { terminalBuffer.carriageReturn() }
             else if ch == "\n" { terminalBuffer.lineFeed() }
@@ -569,6 +570,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
 
     /// Move to the start of the next row, then write `text` (LF before CR so we never repaint from column 0 on the same row).
     private func appendChatLine(_ text: String) {
+        terminalBuffer.resetCurrentAttributesToDefault()
         terminalBuffer.lineFeed()
         terminalBuffer.carriageReturn()
         for ch in text {
@@ -578,6 +580,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     private func showChatPrompt() {
+        terminalBuffer.resetCurrentAttributesToDefault()
         terminalBuffer.lineFeed()
         terminalBuffer.carriageReturn()
         for ch in "chat> " {
@@ -587,6 +590,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     private func appendChatInputCharacters(_ text: String) {
+        terminalBuffer.resetCurrentAttributesToDefault()
         for ch in text {
             terminalBuffer.putChar(ch)
         }
@@ -594,6 +598,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     private func eraseLastChatInputCharacter() {
+        terminalBuffer.resetCurrentAttributesToDefault()
         terminalBuffer.backspace()
         terminalBuffer.putChar(" ")
         terminalBuffer.backspace()

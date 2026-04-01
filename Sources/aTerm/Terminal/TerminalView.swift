@@ -7,6 +7,8 @@ import SwiftUI
 /// never reach `TerminalGridView` (terminal looks frozen).
 struct TerminalView: NSViewControllerRepresentable {
     let buffer: TerminalBuffer
+    /// Bumps whenever `buffer` content changes; same buffer reference would otherwise skip `updateNSViewController`, so scroll/layout and redraw stall.
+    let bufferVersion: UInt64
     let appearance: TerminalAppearance
     let theme: TerminalTheme
     let searchQuery: String
@@ -35,6 +37,7 @@ struct TerminalView: NSViewControllerRepresentable {
     func updateNSViewController(_ controller: TerminalViewController, context: Context) {
         let root = controller.terminalRoot
         root.applyAppearance(appearance, theme: theme)
+        _ = bufferVersion
         root.updateBuffer(buffer)
         context.coordinator.onChatExit = onChatExit
         context.coordinator.onChatEnter = onChatEnter
@@ -290,9 +293,11 @@ final class TerminalContainerView: NSView {
         // compared doc height to clip height only, so it almost never scrolled — the prompt
         // stayed on the last row below the viewport (blank black terminal).
         let shouldFollowTail = isScrolledNearBottom(documentHeight: docHeight)
-        if shouldFollowTail {
+        if shouldFollowTail, scrollView.contentView.bounds.height > 1 {
             let clipH = scrollView.contentView.bounds.height
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, docHeight - clipH)))
+            let targetY = max(0, docHeight - clipH)
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
     }
 
@@ -316,7 +321,8 @@ final class TerminalContainerView: NSView {
         if docH <= clipH + 0.5 { return true }
         let vis = scrollView.documentVisibleRect
         if vis.height <= 0 { return true }
-        return (docH - vis.maxY) <= ch * 2 + 1
+        // Generous slack so rounding / padding doesn’t leave the prompt one row below the clip.
+        return (docH - vis.maxY) <= ch * 6 + 4
     }
 }
 

@@ -121,9 +121,11 @@ func generateIcon(size: Int) -> NSImage {
     return image
 }
 
-// Generate iconset
-let iconsetPath = "/Users/warner/Dev/projects/aTerm/AppIcon.iconset"
+// Generate iconset (run from repository root: `swift scripts/generate-icon.swift`)
 let fm = FileManager.default
+let iconsetPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+    .appendingPathComponent("AppIcon.iconset")
+    .path
 try? fm.removeItem(atPath: iconsetPath)
 try! fm.createDirectory(atPath: iconsetPath, withIntermediateDirectories: true)
 

@@ -4,8 +4,17 @@ struct AgentsSettingsTab: View {
     @EnvironmentObject private var appModel: AppModel
 
     var body: some View {
-        List {
-            ForEach(appModel.availableAgents) { agent in
+        Form {
+            Section {
+                Button("Scan again") {
+                    appModel.refreshAgentInstallationStatuses()
+                }
+            } footer: {
+                Text("Looks in Homebrew paths, ~/.local/bin, Volta, path_helper output, and the app environment PATH.")
+            }
+
+            Section("Installed agents") {
+                ForEach(appModel.availableAgents) { agent in
                 HStack(spacing: 10) {
                     Circle()
                         .fill((appModel.agentStatuses[agent.id]?.isInstalled ?? false) ? Color.green : Color.gray.opacity(0.5))
@@ -44,8 +53,9 @@ struct AgentsSettingsTab: View {
                         .font(.system(size: 11))
                     }
                 }
+                }
             }
         }
-        .listStyle(.inset)
+        .formStyle(.grouped)
     }
 }

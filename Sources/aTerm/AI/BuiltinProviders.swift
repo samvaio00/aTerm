@@ -83,6 +83,20 @@ enum BuiltinProviders {
             .init(id: "kimi-k2.5", name: "Kimi K2.5", contextWindow: 256_000, supportsStreaming: true),
             .init(id: "moonshot-v1-128k", name: "Moonshot V1 128K", contextWindow: 128_000, supportsStreaming: true),
         ]),
+        provider(
+            id: "zai",
+            name: "Z.AI",
+            endpoint: "https://api.z.ai/api/paas/v4/chat/completions",
+            authType: .bearer,
+            apiFormat: .openAICompatible,
+            models: [
+                .init(id: "glm-5", name: "GLM 5", contextWindow: 200_000, supportsStreaming: true),
+                .init(id: "glm-5-turbo", name: "GLM 5 Turbo", contextWindow: 200_000, supportsStreaming: true),
+                .init(id: "glm-4.6", name: "GLM 4.6", contextWindow: 200_000, supportsStreaming: true),
+                .init(id: "glm-4.5", name: "GLM 4.5", contextWindow: 128_000, supportsStreaming: true),
+                .init(id: "glm-4.5-air", name: "GLM 4.5 Air", contextWindow: 128_000, supportsStreaming: true),
+            ]
+        ),
     ]
 
     private static func provider(

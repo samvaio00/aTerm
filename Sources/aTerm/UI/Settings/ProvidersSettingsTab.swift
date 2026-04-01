@@ -3,7 +3,6 @@ import SwiftUI
 struct ProvidersSettingsTab: View {
     @EnvironmentObject private var appModel: AppModel
     @State private var selectedProviderID: String?
-    @State private var isAddingNew = false
 
     var body: some View {
         HSplitView {
@@ -29,30 +28,11 @@ struct ProvidersSettingsTab: View {
                     .tag(provider.id)
                 }
                 .listStyle(.sidebar)
-
-                Divider()
-                Button {
-                    isAddingNew = true
-                    selectedProviderID = nil
-                } label: {
-                    Label("Add custom provider", systemImage: "plus.circle.fill")
-                }
-                .buttonStyle(.borderless)
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minWidth: 220, idealWidth: 240, maxWidth: 280)
 
             Group {
-                if isAddingNew {
-                    ProviderEditorView(provider: nil, onSave: { provider, secret in
-                        try? appModel.upsertProvider(provider, secret: secret)
-                        isAddingNew = false
-                        selectedProviderID = provider.id
-                    }, onCancel: {
-                        isAddingNew = false
-                    })
-                } else if let id = selectedProviderID, let provider = appModel.provider(for: id) {
+                if let id = selectedProviderID, let provider = appModel.provider(for: id) {
                     ProviderEditorView(provider: provider, onSave: { updated, secret in
                         try? appModel.upsertProvider(updated, secret: secret)
                     }, onCancel: { selectedProviderID = nil })
@@ -64,7 +44,7 @@ struct ProvidersSettingsTab: View {
                             .foregroundStyle(.tertiary)
                         Text("Select a provider")
                             .font(.headline)
-                        Text("Choose a built-in provider to add API keys or custom models, or create a new OpenAI-compatible endpoint.")
+                        Text("Choose a provider to configure API keys, OAuth, or extra models.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)

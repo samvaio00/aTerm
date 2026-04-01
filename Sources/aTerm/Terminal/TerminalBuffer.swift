@@ -302,6 +302,13 @@ final class TerminalBuffer {
 
     // MARK: - Character Output
 
+    /// Resets SGR state for text injected locally (chat, banners). The PTY often leaves `currentAttributes`
+    /// at colors that match the theme background, so app-written lines would look blank.
+    func resetCurrentAttributesToDefault() {
+        currentAttributes = CellAttributes()
+        markDirty()
+    }
+
     func putChar(_ char: Character) {
         if wrapPending {
             wrapPending = false

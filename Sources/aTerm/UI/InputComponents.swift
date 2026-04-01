@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Modern Smart Input Bar
@@ -214,7 +215,10 @@ struct ModernQueryResponseCard: View {
     @EnvironmentObject private var windowModel: WindowModel
     @ObservedObject var pane: TerminalPaneViewModel
     @State private var isCollapsed = false
-    
+
+    /// Explicit label color so answer text stays visible over `.thinMaterial` regardless of window appearance.
+    private static let answerTextColor = Color(nsColor: .labelColor)
+
     var body: some View {
         VStack(alignment: .leading, spacing: DesignSystem.Spacing.m) {
             // Header
@@ -225,6 +229,7 @@ struct ModernQueryResponseCard: View {
                         .foregroundColor(.blue)
                     Text(pane.queryResponse.isStreaming ? "Thinking..." : "Answer")
                         .font(DesignSystem.Typography.defaultFont(12, weight: .semibold))
+                        .foregroundStyle(Self.answerTextColor)
                 }
                 
                 Spacer()
@@ -258,14 +263,25 @@ struct ModernQueryResponseCard: View {
             
             // Content
             if !isCollapsed {
-                ScrollView {
-                    Text(pane.queryResponse.text)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .font(DesignSystem.Typography.defaultFont(12))
-                        .textSelection(.enabled)
-                        .lineSpacing(2)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(pane.queryResponse.text)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .font(DesignSystem.Typography.defaultFont(12))
+                            .foregroundStyle(Self.answerTextColor)
+                            .textSelection(.enabled)
+                            .lineSpacing(2)
+                            .id("query-answer-bottom")
+                    }
+                    .frame(maxHeight: 200)
+                    .onChange(of: pane.queryResponse.text) { _ in
+                        if pane.queryResponse.isStreaming {
+                            withAnimation(.easeOut(duration: 0.12)) {
+                                proxy.scrollTo("query-answer-bottom", anchor: .bottom)
+                            }
+                        }
+                    }
                 }
-                .frame(maxHeight: 200)
                 
                 // Suggestions
                 if !pane.queryResponse.suggestions.isEmpty {
@@ -306,6 +322,7 @@ struct ModernQueryResponseCard: View {
         )
         .padding(.horizontal, DesignSystem.Spacing.m)
         .padding(.top, DesignSystem.Spacing.m)
+        .colorScheme(.dark)
     }
 }
 

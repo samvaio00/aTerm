@@ -8,14 +8,12 @@ struct AppearanceSidebarView: View {
     @State private var isImportingTheme = false
     @State private var isCatalogPresented = false
     @State private var newProfileName = ""
-    @State private var draftProvider = ProviderDraft()
-    @State private var isSavingProvider = false
     @State private var quickAPIKey = ""
     @State private var quickKeySaved = false
+    @State private var quickChatAPIKey = ""
+    @State private var quickChatKeySaved = false
     @State private var draftMCPServer = MCPDraft()
     @State private var selectedProviderID: String = ""
-    @State private var isFetchingModels = false
-    @State private var fetchModelsError: String?
 
     /// Includes current tab fonts so `Picker` selection always matches a tag (see FontSupport).
     private var fontPickerOptions: [String] {
@@ -217,76 +215,36 @@ struct AppearanceSidebarView: View {
             .id("chat-model-picker-\(tab.appearance.chatProvider ?? "")")
             .disabled(tab.appearance.chatProvider?.isEmpty ?? true)
 
-            Divider()
-
-            Text("Add or Update Provider")
-                .font(.system(size: 12, weight: .semibold))
-
-            TextField("Slug", text: $draftProvider.id)
-            TextField("Name", text: $draftProvider.name)
-            TextField("Endpoint URL", text: $draftProvider.endpoint)
-
-            Picker("Auth", selection: $draftProvider.authType) {
-                ForEach(AuthType.allCases) { authType in
-                    Text(authType.rawValue).tag(authType)
-                }
-            }
-
-            Picker("Format", selection: $draftProvider.apiFormat) {
-                ForEach(APIFormat.allCases) { apiFormat in
-                    Text(apiFormat.rawValue).tag(apiFormat)
-                }
-            }
-
-            SecureField("API Key / Token", text: $draftProvider.secret)
-
-            HStack {
-                TextField("Model ID", text: $draftProvider.modelID)
-                TextField("Display Name", text: $draftProvider.modelName)
-                Button("Add Model") {
-                    draftProvider.addModel()
-                }
-            }
-
-            ForEach(draftProvider.models, id: \.id) { model in
-                HStack {
-                    Text(model.name.isEmpty ? model.id : model.name)
-                        .font(.system(size: 11, weight: .medium))
-                    Spacer()
-                    Button("Remove") {
-                        draftProvider.models.removeAll(where: { $0.id == model.id })
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            
-            // Fetch models button
-            if draftProvider.apiFormat == .openAICompatible || draftProvider.apiFormat == .custom {
-                Button("Fetch Models") {
-                    fetchModelsForDraftProvider()
-                }
-                .disabled(draftProvider.endpoint.isEmpty || isFetchingModels)
-                
-                if isFetchingModels {
-                    ProgressView()
+            if let chatProv = currentChatProvider, let chatID = tab.appearance.chatProvider, !chatID.isEmpty {
+                let chatUsesSameProviderAsDefault =
+                    tab.appearance.aiProvider.map { $0 == chatID } ?? false
+                if chatUsesSameProviderAsDefault, chatProv.authType != .none, chatProv.authType != .oauthToken {
+                    Text("Chat mode uses the same provider — use the API key field above.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                } else if chatProv.authType == .oauthToken {
+                    Text("Sign in to \(chatProv.name) under Settings → Providers to use chat mode.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if chatProv.authType != .none {
+                    HStack(spacing: 6) {
+                        SecureField("API key (chat mode)", text: $quickChatAPIKey)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11))
+                        Button(quickChatKeySaved ? "Saved" : "Save") {
+                            guard !quickChatAPIKey.isEmpty else { return }
+                            try? appModel.upsertProvider(chatProv, secret: quickChatAPIKey)
+                            quickChatAPIKey = ""
+                            quickChatKeySaved = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { quickChatKeySaved = false }
+                        }
+                        .disabled(quickChatAPIKey.isEmpty)
                         .controlSize(.small)
-                } else if let fetchModelsError {
-                    Text(fetchModelsError)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.red)
-                }
-            }
-
-            HStack {
-                Button(isSavingProvider ? "Saving..." : "Save Provider") {
-                    saveDraftProvider()
-                }
-                .disabled(isSavingProvider || (draftProvider.id.isEmpty && draftProvider.name.isEmpty))
-
-                if let selectedProvider, !selectedProvider.isBuiltin {
-                    Button("Delete") {
-                        appModel.deleteProvider(selectedProvider.id)
                     }
+                    Text("Stored in Keychain for this provider (same as Settings).")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
         }
@@ -572,44 +530,6 @@ struct AppearanceSidebarView: View {
            let profileIndex = appModel.profiles.firstIndex(where: { $0.id == profileID }) {
             appModel.profiles[profileIndex].appearance = appearance
             appModel.persistProfilesPublic()
-        }
-    }
-
-    private func saveDraftProvider() {
-        let provider = draftProvider.toProvider()
-        isSavingProvider = true
-        defer { isSavingProvider = false }
-        do {
-            try appModel.upsertProvider(provider, secret: draftProvider.secret.isEmpty ? nil : draftProvider.secret)
-            draftProvider = ProviderDraft()
-        } catch {
-            appModel.providerStatusMessage = error.localizedDescription
-        }
-    }
-    
-    private func fetchModelsForDraftProvider() {
-        guard !draftProvider.endpoint.isEmpty else { return }
-        isFetchingModels = true
-        fetchModelsError = nil
-        
-        Task {
-            do {
-                let router = ProviderRouter()
-                let apiKey = draftProvider.authType == .none ? nil : draftProvider.secret
-                let fetched = try await router.fetchModels(endpoint: draftProvider.endpoint, apiKey: apiKey)
-                await MainActor.run {
-                    // Merge fetched models with existing ones (avoid duplicates)
-                    let existingIDs = Set(draftProvider.models.map(\.id))
-                    let newModels = fetched.filter { !existingIDs.contains($0.id) }
-                    draftProvider.models.append(contentsOf: newModels)
-                    isFetchingModels = false
-                }
-            } catch {
-                await MainActor.run {
-                    fetchModelsError = "Failed"
-                    isFetchingModels = false
-                }
-            }
         }
     }
 

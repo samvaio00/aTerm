@@ -781,6 +781,11 @@ final class AppModel: ObservableObject {
         agentStatuses = agentDetector.detect(agentDefinitions)
     }
 
+    /// Re-scan common install locations for agent CLIs (GUI apps often have a minimal PATH until refreshed).
+    func refreshAgentInstallationStatuses() {
+        scanAgents()
+    }
+
     private func autoStartGlobalMCPServers() {
         for server in mcpServers where server.autoStart && server.scope == .global {
             startMCPServer(server, cwd: nil)
@@ -1098,7 +1103,8 @@ final class AppModel: ObservableObject {
                 provider: provider,
                 modelID: modelID,
                 conversationHistory: pane.conversationHistory,
-                initialResponse: pane.queryResponse
+                initialResponse: pane.queryResponse,
+                pane: pane
             )
         } catch {
             pane.queryResponse = QueryResponseState(
@@ -1214,11 +1220,20 @@ final class AppModel: ObservableObject {
         provider: ModelProvider,
         modelID: String,
         conversationHistory: ConversationHistory,
-        initialResponse: QueryResponseState
+        initialResponse: QueryResponseState,
+        pane: TerminalPaneViewModel
     ) async throws -> QueryResponseState {
         var queryResponse = initialResponse
+        queryResponse.isStreaming = true
+        pane.queryResponse = queryResponse
+
         let toolSchemas = mcpHost.toolSchemas()
         let maxToolRoundTrips = 5
+
+        func publishProgress() {
+            queryResponse.isStreaming = true
+            pane.queryResponse = queryResponse
+        }
 
         // Tool call loop: stream response, execute any tool calls, feed results back
         for _ in 0..<maxToolRoundTrips {
@@ -1235,6 +1250,7 @@ final class AppModel: ObservableObject {
                 for try await chunk in stream {
                     responseText.append(chunk)
                     queryResponse.text.append(chunk)
+                    publishProgress()
                 }
             } else {
                 // Stream with tool support
@@ -1249,6 +1265,7 @@ final class AppModel: ObservableObject {
                     case .text(let chunk):
                         responseText.append(chunk)
                         queryResponse.text.append(chunk)
+                        publishProgress()
                     case .toolCall(let request):
                         toolCalls.append(request)
                     }
@@ -1268,10 +1285,12 @@ final class AppModel: ObservableObject {
                     let result = try await mcpHost.callTool(name: call.name, arguments: call.arguments)
                     toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: result))
                     queryResponse.text.append("\n\n*[Used tool: \(call.name)]*\n")
+                    publishProgress()
                 } catch {
                     let errorMsg = "Tool '\(call.name)' failed: \(error.localizedDescription)"
                     toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: errorMsg))
                     queryResponse.text.append("\n\n*[\(errorMsg)]*\n")
+                    publishProgress()
                 }
             }
 
@@ -1287,6 +1306,7 @@ final class AppModel: ObservableObject {
 
         queryResponse.isStreaming = false
         queryResponse.suggestions = extractSuggestions(from: queryResponse.text)
+        pane.queryResponse = queryResponse
         return queryResponse
     }
     

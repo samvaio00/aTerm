@@ -456,6 +456,7 @@ private struct ModernTerminalPane: View {
             // Terminal view with padding to prevent cursor/prompt being hidden at edges
             TerminalView(
                 buffer: pane.terminalBuffer,
+                bufferVersion: pane.bufferVersion,
                 appearance: pane.appearance,
                 theme: appModel.theme(for: pane.appearance.themeID),
                 searchQuery: pane.searchQuery,

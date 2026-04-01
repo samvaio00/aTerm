@@ -8,3 +8,15 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Secrets and local credentials (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+credentials.json
+secrets.json
+**/GoogleService-Info.plist
+**/AuthKey_*.p8
+.aTerm-secrets/
