@@ -101,26 +101,52 @@ struct ContentView: View {
 
 private struct WindowCommandHandler: ViewModifier {
     @ObservedObject var windowModel: WindowModel
-    
+
     func body(content: Content) -> some View {
         content
             .onAppear { windowModel.restoreOrCreateInitialTabs() }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermNewTab)) { _ in windowModel.createTabAndSelect() }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermCloseTab)) { _ in windowModel.closeSelectedTab() }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermToggleModelPicker)) { _ in windowModel.toggleModelPicker() }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermToggleSearch)) { _ in windowModel.toggleSearchBar() }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermClearScrollback)) { _ in windowModel.clearSelectedScrollback() }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermSplitH)) { _ in windowModel.splitSelectedPane(.horizontal) }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermSplitV)) { _ in windowModel.splitSelectedPane(.vertical) }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermCommandPalette)) { _ in windowModel.isCommandPalettePresented.toggle() }
-            .onReceive(NotificationCenter.default.publisher(for: .aTermOpenDirectory)) { n in
-                if let url = n.object as? URL { windowModel.createTabAndSelect(workingDirectory: url) }
+            .modifier(TabCommandHandler(windowModel: windowModel))
+            .modifier(PaneCommandHandler(windowModel: windowModel))
+            .modifier(URLCommandHandler(windowModel: windowModel))
+    }
+}
+
+private struct TabCommandHandler: ViewModifier {
+    @ObservedObject var windowModel: WindowModel
+
+    func body(content: Content) -> some View {
+        content
+            .onReceive(NotificationCenter.default.publisher(for: .aTermNewTab)) { _ in
+                windowModel.createTabAndSelect()
             }
-            .onOpenURL { url in
-                guard url.scheme == "aterm", url.host == "open",
-                      let c = URLComponents(url: url, resolvingAgainstBaseURL: false),
-                      let path = c.queryItems?.first(where: { $0.name == "path" })?.value else { return }
-                windowModel.createTabAndSelect(workingDirectory: URL(fileURLWithPath: path))
+            .onReceive(NotificationCenter.default.publisher(for: .aTermCloseTab)) { _ in
+                windowModel.closeSelectedTab()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .aTermToggleModelPicker)) { _ in
+                windowModel.toggleModelPicker()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .aTermCommandPalette)) { _ in
+                windowModel.isCommandPalettePresented.toggle()
+            }
+    }
+}
+
+private struct PaneCommandHandler: ViewModifier {
+    @ObservedObject var windowModel: WindowModel
+
+    func body(content: Content) -> some View {
+        content
+            .onReceive(NotificationCenter.default.publisher(for: .aTermToggleSearch)) { _ in
+                windowModel.toggleSearchBar()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .aTermClearScrollback)) { _ in
+                windowModel.clearSelectedScrollback()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .aTermSplitH)) { _ in
+                windowModel.splitSelectedPane(.horizontal)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .aTermSplitV)) { _ in
+                windowModel.splitSelectedPane(.vertical)
             }
             .onReceive(NotificationCenter.default.publisher(for: .aTermSaveOutput)) { _ in
                 guard let pane = windowModel.selectedTab?.activePane else { return }
@@ -132,6 +158,25 @@ private struct WindowCommandHandler: ViewModifier {
                     guard r == .OK, let url = panel.url else { return }
                     try? text.write(to: url, atomically: true, encoding: .utf8)
                 }
+            }
+    }
+}
+
+private struct URLCommandHandler: ViewModifier {
+    @ObservedObject var windowModel: WindowModel
+
+    func body(content: Content) -> some View {
+        content
+            .onReceive(NotificationCenter.default.publisher(for: .aTermOpenDirectory)) { n in
+                if let url = n.object as? URL {
+                    windowModel.createTabAndSelect(workingDirectory: url)
+                }
+            }
+            .onOpenURL { url in
+                guard url.scheme == "aterm", url.host == "open",
+                      let c = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                      let path = c.queryItems?.first(where: { $0.name == "path" })?.value else { return }
+                windowModel.createTabAndSelect(workingDirectory: URL(fileURLWithPath: path))
             }
     }
 }
