@@ -20,3 +20,7 @@ secrets.json
 **/GoogleService-Info.plist
 **/AuthKey_*.p8
 .aTerm-secrets/
+
+# Local install / packaging output (never commit)
+/aTerm.app/
+/build/
