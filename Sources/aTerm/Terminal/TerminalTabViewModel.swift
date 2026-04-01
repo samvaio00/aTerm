@@ -51,12 +51,14 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     @Published var isChatModeActive = false
     @Published var chatProviderID: String?
     @Published var chatModelID: String?
-    let chatConversationHistory = ConversationHistory()
+    let chatConversationHistory = ConversationHistory(maxMessages: 60)
 
     private(set) var profileID: UUID?
     private(set) var profileName: String
     var stateDidChange: (() -> Void)?
     var onChatRequest: ((String) -> Void)?
+    /// When set, Return on the main shell screen routes the typed line through smart classification instead of only the PTY.
+    var onSubmitSmartLine: ((String) -> Void)?
 
     private var preferredWorkingDirectory: URL?
     private var currentColumns: UInt16 = 100
@@ -71,6 +73,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     private var lastOutputSnippet = ""
     private var lastExitCode: Int32?
     private var recentFailures: [String] = []
+    private var chatInputBuffer = ""
     private var sessionStartTime: Date?
     private var projectInfo: ProjectContextDetector.ProjectInfo = ProjectContextDetector.ProjectInfo(type: .generic, gitBranch: nil, rootDirectory: nil)
     private let explicitLaunchConfiguration: PTYLaunchConfiguration?
@@ -136,10 +139,64 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             return
         }
 
+        // Return on the main screen: classify the visible line (zsh already holds the same text in readline).
+        if !isChatModeActive, !isAgentTab, !terminalBuffer.isAlternateScreen,
+           let onSubmitSmartLine,
+           data == Data([0x0d]) || data == Data([0x0a]) {
+            let userLine = terminalBuffer.userInputForSmartClassification()
+            if userLine.isEmpty {
+                if session.isRunning {
+                    session.send(data)
+                } else {
+                    restartSessionIfPossible()
+                }
+                return
+            }
+            onSubmitSmartLine(userLine)
+            return
+        }
+
         // Check for chat command interception
         if let text = String(data: data, encoding: .utf8) {
+            if isChatModeActive {
+                // In chat mode, collect a full line and only send to AI on Enter.
+                if text == "\r" || text == "\n" || text == "\r\n" {
+                    let message = chatInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                    appendChatLine("")
+                    chatInputBuffer = ""
+                    if message.lowercased() == "/chat-exit" || message.lowercased() == "/chat-eixt" {
+                        exitChatMode()
+                        return
+                    }
+                    if !message.isEmpty {
+                        onChatRequest?(message)
+                    } else {
+                        showChatPrompt()
+                    }
+                    return
+                }
+
+                // Handle backspace/delete in local chat line buffer.
+                if text == "\u{7f}" || text == "\u{8}" {
+                    if !chatInputBuffer.isEmpty {
+                        chatInputBuffer.removeLast()
+                        eraseLastChatInputCharacter()
+                    }
+                    return
+                }
+
+                // Ignore escape and other control characters while building the chat line.
+                if text.unicodeScalars.allSatisfy({ $0.value < 0x20 || $0.value == 0x7f }) {
+                    return
+                }
+
+                chatInputBuffer.append(text)
+                appendChatInputCharacters(text)
+                return
+            }
+
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.lowercased() == "/chat-exit" {
+            if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chat-eixt" {
                 exitChatMode()
                 return
             }
@@ -150,11 +207,6 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
                     // Process the chat message via callback
                     onChatRequest?(chatContent)
                 }
-                return
-            }
-            // If in chat mode, treat all input as chat messages
-            if isChatModeActive && !trimmed.isEmpty {
-                onChatRequest?(trimmed)
                 return
             }
         }
@@ -224,8 +276,29 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     func sendTerminalCommand(_ command: String) {
         let normalized = command.hasSuffix("\n") ? command : command + "\n"
         recordTerminalCommand(command)
-        handleInput(Data(normalized.utf8))
+        guard let session else {
+            Log.debug("input", "sendTerminalCommand: no session")
+            return
+        }
+        if session.isRunning {
+            session.send(Data(normalized.utf8))
+        } else {
+            Log.debug("input", "sendTerminalCommand: session not running, restart")
+            restartSessionIfPossible()
+        }
         modeIndicatorText = isAgentTab ? "AGENT" : InputMode.terminal.rawValue
+    }
+
+    /// Submit a line zsh already has buffered (user typed at the prompt; we withheld Return).
+    func sendBufferedReturnToShell() {
+        guard let session, session.isRunning else { return }
+        session.send(Data([0x0d]))
+    }
+
+    /// Emacs-style kill line (zsh default); clears a line the user typed when we handle it in-app instead.
+    func sendShellKillLineToPTY() {
+        guard let session, session.isRunning else { return }
+        session.send(Data([0x15]))
     }
 
     /// Export scrollback + screen content as plain text
@@ -246,15 +319,29 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         isChatModeActive = true
         chatProviderID = providerID
         chatModelID = modelID
+        chatInputBuffer = ""
         modeIndicatorText = "CHAT"
         chatConversationHistory.clear()
+        appendChatLine("[chat mode enabled: type a message and press Enter, /chat-exit to leave]")
+        showChatPrompt()
     }
     
     func exitChatMode() {
         isChatModeActive = false
+        chatInputBuffer = ""
         modeIndicatorText = isAgentTab ? "AGENT" : InputMode.terminal.rawValue
         // Clear conversation history when exiting chat mode
         chatConversationHistory.clear()
+        appendChatLine("[chat mode disabled: back to terminal]")
+        syncShellLineAfterChatExit()
+    }
+
+    /// `/chat` and `/chat-exit` are handled locally, so the shell never receives Enter; clear the
+    /// pending line and submit an empty line so zsh redraws a normal prompt.
+    private func syncShellLineAfterChatExit() {
+        guard let session, session.isRunning else { return }
+        session.send(Data([0x15])) // Ctrl+U — kill line (zsh emacs default)
+        session.send(Data("\r".utf8))
     }
 
     func clearScrollback() {
@@ -339,28 +426,28 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             session.start()
             Log.debug("pty", "PTY started successfully for pane=\(id)")
 
-            outputTask = Task { [weak self] in
-                guard let self else { return }
-                for await event in session.events {
+            // Events are yielded from the PTY read queue; consume them on the main actor so
+            // TerminalBuffer / @Published updates and AppKit redraws are well-defined.
+            let eventStream = session.events
+            // Consume the PTY stream entirely on the main actor: one task, one isolation domain,
+            // same as UI observation — avoids per-chunk MainActor.run scheduling that can backlog
+            // the main queue and starve key events / redraws under heavy output.
+            outputTask = Task { @MainActor [weak self] in
+                for await event in eventStream {
+                    guard let self else { return }
                     switch event {
                     case let .output(data):
                         self.vt100Parser.feed(data)
-                        // Sync mode flags
                         TerminalKeyMapper.applicationCursorKeys = self.terminalBuffer.applicationCursorKeys
                         self.isAlternateScreen = self.terminalBuffer.isAlternateScreen
-                        // Handle bell
                         if self.terminalBuffer.bellFired {
                             self.terminalBuffer.bellFired = false
                             NSApplication.shared.requestUserAttention(.informationalRequest)
                         }
-                        // Capture a short snippet for AI context (cheap)
                         self.lastOutputSnippet = self.terminalBuffer.lastScreenLine(maxChars: 120)
-                        // Trigger view redraw without recreating the view
                         self.bufferVersion &+= 1
-                        // Lazily update displayText for search only when search is active
                         if self.isSearchPresented { self.scheduleSearchUpdate() }
 
-                        // Check buffer for title/cwd changes
                         if let workingDirectory = self.terminalBuffer.workingDirectory {
                             if workingDirectory != self.currentWorkingDirectory {
                                 self.currentWorkingDirectory = workingDirectory
@@ -386,7 +473,19 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             Log.error("pty", "Failed to start session for pane=\(id): \(error.localizedDescription)")
             statusText = "failed to start session"
             displayText = "Failed to start session: \(error.localizedDescription)"
+            appendSystemNoticeToBuffer(
+                "aTerm could not start the shell: \(error.localizedDescription)\r\n\r\nCheck Profiles → Shell, or that zsh is installed and listed in /etc/shells.\r\n"
+            )
         }
+    }
+
+    private func appendSystemNoticeToBuffer(_ text: String) {
+        for ch in text {
+            if ch == "\r" { terminalBuffer.carriageReturn() }
+            else if ch == "\n" { terminalBuffer.lineFeed() }
+            else { terminalBuffer.putChar(ch) }
+        }
+        bufferVersion &+= 1
     }
 
     private func handleExit(status: Int32) {
@@ -467,6 +566,108 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     private var searchResult = SearchResult(matches: [])
+
+    /// Move to the start of the next row, then write `text` (LF before CR so we never repaint from column 0 on the same row).
+    private func appendChatLine(_ text: String) {
+        terminalBuffer.lineFeed()
+        terminalBuffer.carriageReturn()
+        for ch in text {
+            terminalBuffer.putChar(ch)
+        }
+        bufferVersion &+= 1
+    }
+
+    private func showChatPrompt() {
+        terminalBuffer.lineFeed()
+        terminalBuffer.carriageReturn()
+        for ch in "chat> " {
+            terminalBuffer.putChar(ch)
+        }
+        bufferVersion &+= 1
+    }
+
+    private func appendChatInputCharacters(_ text: String) {
+        for ch in text {
+            terminalBuffer.putChar(ch)
+        }
+        bufferVersion &+= 1
+    }
+
+    private func eraseLastChatInputCharacter() {
+        terminalBuffer.backspace()
+        terminalBuffer.putChar(" ")
+        terminalBuffer.backspace()
+        bufferVersion &+= 1
+    }
+
+    /// Word-wrap at spaces so Core Text grid wrapping does not split mid-word.
+    private static func wrapChatParagraph(_ paragraph: String, lineBudget: Int) -> [String] {
+        guard !paragraph.isEmpty else { return [] }
+        let words = paragraph.split { $0.isWhitespace || $0.isNewline }.map(String.init)
+        guard !words.isEmpty else { return [String(paragraph.prefix(lineBudget))] }
+
+        var lines: [String] = []
+        var current = ""
+
+        func flush() {
+            if !current.isEmpty {
+                lines.append(current)
+                current = ""
+            }
+        }
+
+        for word in words {
+            let candidate = current.isEmpty ? word : "\(current) \(word)"
+            if candidate.count <= lineBudget {
+                current = candidate
+            } else {
+                flush()
+                if word.count > lineBudget {
+                    var rest = word
+                    while rest.count > lineBudget {
+                        lines.append(String(rest.prefix(lineBudget)))
+                        rest = String(rest.dropFirst(lineBudget))
+                    }
+                    current = rest
+                } else {
+                    current = word
+                }
+            }
+        }
+        flush()
+        return lines.isEmpty ? [""] : lines
+    }
+
+    func appendChatAssistantResponse(_ text: String) {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            appendChatLine("ai> [no response]")
+            showChatPrompt()
+            return
+        }
+
+        let prefixLength = 4 // "ai> " and "    "
+        let columns = max(40, terminalBuffer.columns)
+        let lineBudget = max(24, columns - prefixLength)
+
+        let normalized = cleaned.replacingOccurrences(of: "\r\n", with: "\n")
+        let paragraphs = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        var firstRendered = true
+        for para in paragraphs {
+            if para.isEmpty {
+                appendChatLine("    ")
+                continue
+            }
+            let wrapped = Self.wrapChatParagraph(para, lineBudget: lineBudget)
+            for w in wrapped {
+                let prefix = firstRendered ? "ai> " : "    "
+                appendChatLine(prefix + w)
+                firstRendered = false
+            }
+        }
+        showChatPrompt()
+    }
 }
 
 @MainActor
@@ -634,6 +835,7 @@ final class TerminalTabViewModel: ObservableObject, Identifiable {
             self?.stateDidChange?()
         }
         clone.onChatRequest = activePane.onChatRequest
+        clone.onSubmitSmartLine = activePane.onSubmitSmartLine
         panes.append(clone)
         activePaneID = clone.id
         splitOrientation = splitOrientation ?? orientation

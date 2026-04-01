@@ -54,6 +54,7 @@ struct ContentView: View {
                     // Terminal workspace
                     if let selectedTab = windowModel.selectedTab {
                         ModernTerminalWorkspace(tab: selectedTab)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         EmptyStateView(
                             icon: "terminal",
@@ -81,17 +82,15 @@ struct ContentView: View {
     
     @ViewBuilder
     private var overlayGroup: some View {
+        // One branch only: multiple sibling `if`s become a TupleView that can sit full-size in the
+        // ZStack and swallow clicks/keyboard even when every panel is closed.
         if windowModel.isModelPickerPresented {
             ModernModelPicker()
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
-        }
-        
-        if windowModel.isCommandPalettePresented {
+        } else if windowModel.isCommandPalettePresented {
             ModernCommandPalette()
                 .transition(.opacity.combined(with: .move(edge: .top)))
-        }
-        
-        if windowModel.isAgentPickerPresented {
+        } else if windowModel.isAgentPickerPresented {
             ModernAgentPicker()
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
         }
@@ -144,7 +143,7 @@ private struct ModernTabStrip: View {
     @ObservedObject var windowModel: WindowModel
     @Binding var isSidebarVisible: Bool
     
-    private static let buildStamp = "b:2026-03-23"
+    private static let buildStamp = "b:2026-04-01-io"
     
     var body: some View {
         HStack(spacing: 0) {
@@ -294,6 +293,7 @@ private struct ModernTerminalWorkspace: View {
     var body: some View {
         GeometryReader { geometry in
             paneLayout(for: tab.panes, in: geometry.size)
+                .frame(width: geometry.size.width, height: geometry.size.height)
         }
     }
     
@@ -404,7 +404,7 @@ private struct ModernTerminalPane: View {
     var body: some View {
         VStack(spacing: 0) {
             // Modern header
-            ModernPaneHeader(pane: pane, isActive: isActive, onClose: onClose)
+            ModernPaneHeader(pane: pane, isActive: isActive, onClose: onClose, onSelect: onSelect)
             
             SubtleDivider()
             
@@ -433,6 +433,10 @@ private struct ModernTerminalPane: View {
                 }
             )
             .id("\(pane.appearance.themeID)-\(pane.id)")
+            // NSViewRepresentable has no intrinsic size; without max frame the view can collapse to
+            // zero height so clicks/keys hit SwiftUI behind it and the PTY grid never focuses.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .focusable(false)
             .background(Color(appModel.theme(for: pane.appearance.themeID).palette.background.nsColor))
             .padding(.vertical, 4)
             
@@ -460,34 +464,28 @@ private struct ModernTerminalPane: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
                 
-                if !pane.queryResponse.text.isEmpty || pane.queryResponse.isStreaming {
+                if !pane.isChatModeActive && (!pane.queryResponse.text.isEmpty || pane.queryResponse.isStreaming) {
                     ModernQueryResponseCard(pane: pane)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .padding(.bottom, pane.isAlternateScreen ? 0 : DesignSystem.Spacing.m)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(DesignSystem.Colors.terminalBackground)
+        // Border must not participate in hit testing — otherwise it sits above `TerminalView` and
+        // steals all clicks/keyboard routing from the AppKit grid (terminal appears frozen).
         .overlay {
             RoundedRectangle(cornerRadius: 0)
                 .strokeBorder(isActive ? DesignSystem.Colors.paneBorderActive : DesignSystem.Colors.paneBorder, lineWidth: isActive ? 1.5 : 0.5)
+                .allowsHitTesting(false)
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            onSelect()
-        }
-        .task { pane.startIfNeeded() }
+        .onAppear { pane.startIfNeeded() }
         .animation(DesignSystem.Animation.normal, value: pane.isSearchPresented)
         .animation(DesignSystem.Animation.normal, value: pane.agentExitBanner != nil)
         .animation(DesignSystem.Animation.normal, value: pane.submissionState.isWaiting)
         .animation(DesignSystem.Animation.normal, value: pane.aiShellState.isGenerating)
         .animation(DesignSystem.Animation.normal, value: pane.queryResponse.isStreaming)
-        .onAppear {
-            // Ensure terminal takes focus immediately in traditional mode
-            DispatchQueue.main.async {
-                NSApp.keyWindow?.makeFirstResponder(nil)
-            }
-        }
     }
 }
 
@@ -497,6 +495,7 @@ private struct ModernPaneHeader: View {
     @ObservedObject var pane: TerminalPaneViewModel
     let isActive: Bool
     let onClose: (() -> Void)?
+    let onSelect: () -> Void
     
     var body: some View {
         HStack(spacing: DesignSystem.Spacing.m) {
@@ -545,6 +544,8 @@ private struct ModernPaneHeader: View {
         .padding(.horizontal, DesignSystem.Spacing.m)
         .padding(.vertical, 8)
         .background(DesignSystem.Colors.backgroundPrimary)
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
     }
     
     private var modeIcon: some View {

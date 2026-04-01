@@ -70,7 +70,11 @@ final class AppModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 500_000_000)
             self?.autoStartGlobalMCPServers()
         }
-        Task { await detectOllamaModels() }
+        Task {
+            // Yield so the main window and Settings (if opened) can lay out before network + provider writes.
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            await detectOllamaModels()
+        }
         Log.debug("app", "AppModel.init() done, onboarding=\(isOnboardingPresented)")
     }
 
@@ -315,13 +319,14 @@ final class AppModel: ObservableObject {
     }
 
     func upsertProvider(_ provider: ModelProvider, secret: String?) throws {
-        // For builtin providers, merge user changes (like OAuth client ID) into the existing entry
+        // For builtin providers, merge OAuth and model list (custom models + fetched models) into the existing entry
         if let existingIndex = providers.firstIndex(where: { $0.id == provider.id }),
            providers[existingIndex].isBuiltin {
             var existing = providers[existingIndex]
             if let newOAuth = provider.oauthConfig {
                 existing.oauthConfig = newOAuth
             }
+            existing.models = provider.models
             providers[existingIndex] = existing
         } else {
             providers.removeAll(where: { $0.id == provider.id })
@@ -381,21 +386,36 @@ final class AppModel: ObservableObject {
 
         let rawInput = pane.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawInput.isEmpty else { return }
-        
-        // Handle /chat-exit command
-        if inputClassifier.isChatExitCommand(rawInput) {
-            pane.exitChatMode()
-            pane.inputText = ""
+        pane.inputText = ""
+        submitSmartInput(rawInput: rawInput, for: pane, lineAlreadyBufferedInShell: false)
+    }
+
+    /// Smart routing for a line typed at the zsh prompt (PTY already holds the text; Return was not sent yet).
+    func submitSmartLineFromPrompt(_ rawInput: String, for pane: TerminalPaneViewModel) {
+        submitSmartInput(rawInput: rawInput, for: pane, lineAlreadyBufferedInShell: true)
+    }
+
+    private func submitSmartInput(rawInput: String, for pane: TerminalPaneViewModel, lineAlreadyBufferedInShell: Bool) {
+        let rawInput = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawInput.isEmpty else { return }
+
+        if pane.isAgentTab {
+            pane.sendTerminalCommand(rawInput)
             return
         }
-        
-        // Handle /chat command - enter chat mode
+
+        if inputClassifier.isChatExitCommand(rawInput) {
+            pane.exitChatMode()
+            return
+        }
+
         if inputClassifier.isChatCommand(rawInput) {
             let displayInput = inputClassifier.strippedOverrideInput(rawInput)
-            pane.inputText = ""
-            // Enter chat mode with separate chat model if configured
             pane.enterChatMode(providerID: pane.appearance.chatProvider, modelID: pane.appearance.chatModel)
-            // Process the chat message immediately if there's content
+            if lineAlreadyBufferedInShell {
+                pane.sendShellKillLineToPTY()
+                pane.sendBufferedReturnToShell()
+            }
             if !displayInput.isEmpty {
                 Task { @MainActor in
                     await answerChatQuery(displayInput, for: pane)
@@ -403,18 +423,31 @@ final class AppModel: ObservableObject {
             }
             return
         }
-        
-        // If in chat mode, process all input as chat
+
         if pane.isChatModeActive {
-            pane.inputText = ""
+            if lineAlreadyBufferedInShell {
+                pane.sendShellKillLineToPTY()
+                pane.sendBufferedReturnToShell()
+            }
             Task { @MainActor in
                 await answerChatQuery(rawInput, for: pane)
             }
             return
         }
-        
+
+        // Prompt-only UX: unprefixed lines run directly in shell.
+        // Smart routing from the prompt is opt-in via explicit prefixes (!, >, $) or /chat.
+        if lineAlreadyBufferedInShell {
+            let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isExplicitSmartLine = trimmed.first.map { ["!", ">", "$"].contains($0) } ?? false
+            if !isExplicitSmartLine {
+                pane.clearAssistantState()
+                pane.sendBufferedReturnToShell()
+                return
+            }
+        }
+
         let displayInput = inputClassifier.strippedOverrideInput(rawInput)
-        pane.inputText = ""
 
         Task { @MainActor in
             let provider = self.provider(for: pane.appearance.aiProvider)
@@ -429,16 +462,24 @@ final class AppModel: ObservableObject {
                 )
 
                 guard let result else {
+                    if lineAlreadyBufferedInShell {
+                        pane.sendShellKillLineToPTY()
+                    }
                     pane.submissionState = .waitingForDisambiguation(displayInput)
                     pane.modeIndicatorText = "AMBIGUOUS"
                     return
                 }
 
-                // Log classification explanation for debugging
                 Log.debug("classifier", "Input: '\(displayInput)' -> \(result.mode.rawValue) (\(result.confidence.description): \(String(format: "%.2f", result.score)))")
                 Log.debug("classifier", "Reasons: \(result.explanation.reasons.joined(separator: "; "))")
 
-                await executeClassificationResult(result, input: displayInput, rawInput: rawInput, pane: pane)
+                await executeClassificationResult(
+                    result,
+                    input: displayInput,
+                    rawInput: rawInput,
+                    pane: pane,
+                    lineAlreadyBufferedInShell: lineAlreadyBufferedInShell
+                )
             } catch {
                 pane.queryResponse = QueryResponseState(
                     text: "Classification failed: \(error.localizedDescription)",
@@ -454,13 +495,11 @@ final class AppModel: ObservableObject {
         _ result: ClassificationResult,
         input: String,
         rawInput: String,
-        pane: TerminalPaneViewModel
+        pane: TerminalPaneViewModel,
+        lineAlreadyBufferedInShell: Bool
     ) async {
-        // Result available for potential feedback tracking
-
         switch result.mode {
         case .terminal:
-            // Check for dangerous commands
             if inputClassifier.isDangerousCommand(input) {
                 pane.queryResponse = QueryResponseState(
                     text: "⚠️ Warning: This command may be destructive. Press ⌘↵ to execute anyway, or try '!' prefix to ask about it.",
@@ -470,17 +509,29 @@ final class AppModel: ObservableObject {
                 pane.modeIndicatorText = "WARNING"
                 return
             }
-            
+
             pane.clearAssistantState()
-            pane.sendTerminalCommand(input)
-            
+            if lineAlreadyBufferedInShell {
+                pane.sendBufferedReturnToShell()
+            } else {
+                pane.sendTerminalCommand(input)
+            }
+
         case .aiToShell:
+            if lineAlreadyBufferedInShell {
+                pane.sendShellKillLineToPTY()
+                pane.sendBufferedReturnToShell()
+            }
             pane.queryResponse = QueryResponseState()
             pane.submissionState = .idle
             pane.modeIndicatorText = "\(InputMode.aiToShell.rawValue) (\(result.confidence.description))"
             await generateShellCommand(from: input, for: pane)
-            
+
         case .query:
+            if lineAlreadyBufferedInShell {
+                pane.sendShellKillLineToPTY()
+                pane.sendBufferedReturnToShell()
+            }
             pane.aiShellState = AIShellState()
             pane.submissionState = .idle
             pane.modeIndicatorText = "\(InputMode.query.rawValue) (\(result.confidence.description))"
@@ -604,13 +655,27 @@ final class AppModel: ObservableObject {
         Log.debug("app", "completeOnboarding() done, isOnboardingPresented=\(isOnboardingPresented)")
     }
 
+    /// `.app` installs use `Contents/Resources`; `swift build` keeps `aTerm_aTerm.bundle` next to the executable.
+    private static func bundledShellIntegrationURL() -> URL? {
+        if let u = Bundle.main.url(forResource: "shell-integration", withExtension: "zsh", subdirectory: "Resources") {
+            return u
+        }
+        guard let bin = Bundle.main.executableURL else { return nil }
+        let dir = bin.deletingLastPathComponent()
+        let candidates = [
+            dir.appendingPathComponent("aTerm_aTerm.bundle/Resources/shell-integration.zsh"),
+            dir.appendingPathComponent("aTerm_aTerm.bundle/Contents/Resources/shell-integration.zsh"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
     func installShellIntegration() {
         let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         let destination = home.appendingPathComponent(".aterm-shell-integration.zsh")
         let zshrc = home.appendingPathComponent(".zshrc")
         let sourceLine = "\nsource \"\(destination.path)\"\n"
 
-        guard let sourceURL = Bundle.module.url(forResource: "shell-integration", withExtension: "zsh", subdirectory: "Resources") else {
+        guard let sourceURL = Self.bundledShellIntegrationURL() else {
             shellIntegrationMessage = "Bundled shell integration script not found."
             return
         }
@@ -658,13 +723,24 @@ final class AppModel: ObservableObject {
         if let stored = providerStore.load() {
             // Keep custom providers that aren't builtins
             let customProviders = stored.providers.filter { !builtinIDs.contains($0.id) }
-            // Merge saved OAuth client IDs back into builtin providers
-            let builtins = BuiltinProviders.all.map { p -> ModelProvider in
-                guard var p = Optional(p),
-                      let clientID = stored.oauthClientIDs[p.id],
-                      var oauth = p.oauthConfig else { return p }
-                oauth.clientID = clientID
-                p.oauthConfig = oauth
+            let extrasByID = stored.builtinExtraModels ?? [:]
+            // Merge saved OAuth client IDs and user-added models back into builtin providers
+            let builtins = BuiltinProviders.all.map { base -> ModelProvider in
+                var p = base
+                if let clientID = stored.oauthClientIDs[p.id],
+                   var oauth = p.oauthConfig {
+                    oauth.clientID = clientID
+                    p.oauthConfig = oauth
+                }
+                let extras = extrasByID[p.id] ?? []
+                if !extras.isEmpty {
+                    var merged = p.models
+                    let ids = Set(merged.map(\.id))
+                    for m in extras where !ids.contains(m.id) {
+                        merged.append(m)
+                    }
+                    p.models = merged
+                }
                 return p
             }
             providers = builtins + customProviders
@@ -674,8 +750,10 @@ final class AppModel: ObservableObject {
             providers = BuiltinProviders.all
             defaultProviderID = "ollama"
             defaultModelID = nil
+            persistProviders()
         }
-        persistProviders()
+        // Do not persist on every launch when `providers.json` already exists — avoids extra I/O
+        // and duplicate @Published churn while the UI (including Settings) is coming up.
     }
 
     private func restoreAgents() {
@@ -825,16 +903,24 @@ final class AppModel: ObservableObject {
     private func persistProviders() {
         // Collect OAuth client IDs from builtin providers (user-entered)
         var oauthClientIDs: [String: String] = [:]
+        var builtinExtraModels: [String: [ModelDefinition]] = [:]
         for p in providers where p.isBuiltin {
             if let clientID = p.oauthConfig?.clientID, !clientID.isEmpty {
                 oauthClientIDs[p.id] = clientID
+            }
+            let baseline = BuiltinProviders.all.first(where: { $0.id == p.id })?.models ?? []
+            let baselineIDs = Set(baseline.map(\.id))
+            let extras = p.models.filter { !baselineIDs.contains($0.id) }
+            if !extras.isEmpty {
+                builtinExtraModels[p.id] = extras
             }
         }
         providerStore.save(.init(
             providers: providers.filter { !$0.isBuiltin },
             defaultProviderID: defaultProviderID,
             defaultModelID: defaultModelID,
-            oauthClientIDs: oauthClientIDs
+            oauthClientIDs: oauthClientIDs,
+            builtinExtraModels: builtinExtraModels.isEmpty ? nil : builtinExtraModels
         ))
     }
 
@@ -1025,9 +1111,6 @@ final class AppModel: ObservableObject {
 
     /// Answer query in chat mode (persistent context, uses separate chat model config)
     func answerChatQuery(_ input: String, for pane: TerminalPaneViewModel) async {
-        // Reset response with streaming state
-        pane.queryResponse = QueryResponseState(text: "", isStreaming: true, suggestions: [])
-
         // Use chat-specific provider/model if configured, otherwise fall back to default
         let provider: ModelProvider
         let modelID: String
@@ -1042,19 +1125,17 @@ final class AppModel: ObservableObject {
             provider = defaultProvider
             modelID = defaultModel
         } else {
-            pane.queryResponse = QueryResponseState(
-                text: "No provider or model configured for chat mode. Set up chat model in Settings.",
-                isStreaming: false,
-                suggestions: []
-            )
+            pane.appendChatAssistantResponse("No provider or model configured for chat mode. Set up chat model in Settings.")
             return
         }
 
         do {
-            // Build chat system message (more conversational)
+            // Build chat system message (multi-turn: full history is sent each request)
             let systemPrompt = """
-            You are a helpful coding assistant. Answer questions about programming, terminal usage, and development workflows.
-            Be conversational but concise. When shell commands would help, include them in ```bash blocks.
+            You are a helpful assistant inside a terminal app. The messages in this chat are one continuous session—read earlier turns and keep continuity (user preferences, location, projects, names, decisions). Refer back when relevant; do not ask the user to repeat context they already gave unless it was many turns ago or unclear.
+
+            Prefer concise answers. Use markdown: short paragraphs, ```bash or ```python for commands/code. Keep prose lines reasonably short so they read well in a fixed-width terminal.
+
             Current directory: \(pane.currentWorkingDirectory?.path ?? "unknown")
             """
 
@@ -1065,20 +1146,54 @@ final class AppModel: ObservableObject {
             
             pane.chatConversationHistory.addUserMessage(input)
 
-            // Stream response directly to pane (updates UI in real-time)
-            try await streamAIResponseToPane(
+            // Chat mode: stream text only (no MCP tools). Tool-enabled streams often return empty text on the first round-trip.
+            let responseText = try await streamChatTextOnly(
                 provider: provider,
                 modelID: modelID,
                 conversationHistory: pane.chatConversationHistory,
                 pane: pane
             )
+            let trimmed = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                pane.chatConversationHistory.addAssistantMessage(trimmed)
+            }
+            pane.appendChatAssistantResponse(responseText)
+            pane.queryResponse = QueryResponseState()
         } catch {
+            let errorText = "Chat query failed: \(error.localizedDescription)"
+            pane.appendChatAssistantResponse(errorText)
+            pane.queryResponse = QueryResponseState()
+        }
+    }
+
+    /// Streams assistant text without tools; returns the full string for in-terminal chat.
+    private func streamChatTextOnly(
+        provider: ModelProvider,
+        modelID: String,
+        conversationHistory: ConversationHistory,
+        pane: TerminalPaneViewModel
+    ) async throws -> String {
+        var accumulated = ""
+        let stream = try providerRouter.streamResponse(
+            provider: provider,
+            modelID: modelID,
+            messages: conversationHistory.simplifiedMessages
+        )
+        for try await chunk in stream {
+            accumulated.append(chunk)
+            let text = accumulated
+            await MainActor.run {
+                pane.queryResponse = QueryResponseState(text: text, isStreaming: true, suggestions: [])
+            }
+        }
+        await MainActor.run {
             pane.queryResponse = QueryResponseState(
-                text: "Chat query failed: \(error.localizedDescription)",
+                text: accumulated,
                 isStreaming: false,
-                suggestions: []
+                suggestions: extractSuggestions(from: accumulated)
             )
         }
+        return accumulated
     }
 
     private func extractSuggestions(from text: String) -> [QueryCommandSuggestion] {

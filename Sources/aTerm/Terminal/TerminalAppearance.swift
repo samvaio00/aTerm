@@ -82,6 +82,7 @@ struct TerminalAppearance: Codable, Hashable {
     var lineHeight: Double
     var letterSpacing: Double
     var opacity: Double
+    /// Frosted material strength (0…1). Does not control view alpha; the terminal stays visible at 0.
     var blur: Double
     var padding: TerminalPadding
     var cursorStyle: CursorStyle

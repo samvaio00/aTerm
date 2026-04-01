@@ -2,7 +2,10 @@ import AppKit
 import CoreText
 import SwiftUI
 
-struct TerminalView: NSViewRepresentable {
+/// Hosts the terminal in an `NSViewController` so AppKit’s responder chain includes the PTY grid.
+/// Plain `NSViewRepresentable` often leaves a SwiftUI focus host as first responder, so key events
+/// never reach `TerminalGridView` (terminal looks frozen).
+struct TerminalView: NSViewControllerRepresentable {
     let buffer: TerminalBuffer
     let appearance: TerminalAppearance
     let theme: TerminalTheme
@@ -23,24 +26,24 @@ struct TerminalView: NSViewRepresentable {
         return coordinator
     }
 
-    func makeNSView(context: Context) -> TerminalContainerView {
-        let view = TerminalContainerView()
-        view.configure(with: context.coordinator)
-        return view
+    func makeNSViewController(context: Context) -> TerminalViewController {
+        let controller = TerminalViewController()
+        controller.terminalRoot.configure(with: context.coordinator)
+        return controller
     }
 
-    func updateNSView(_ nsView: TerminalContainerView, context: Context) {
-        nsView.applyAppearance(appearance, theme: theme)
-        nsView.updateBuffer(buffer)
-        // Update chat callbacks in case they changed
+    func updateNSViewController(_ controller: TerminalViewController, context: Context) {
+        let root = controller.terminalRoot
+        root.applyAppearance(appearance, theme: theme)
+        root.updateBuffer(buffer)
         context.coordinator.onChatExit = onChatExit
         context.coordinator.onChatEnter = onChatEnter
-        // When the running program switches to alternate screen (vim, less, claude, etc.),
-        // grab keyboard focus so keystrokes go directly to the PTY
-        if buffer.isAlternateScreen {
-            nsView.focusTerminal()
+        let alt = buffer.isAlternateScreen
+        let wasAlt = root.lastAppliedAlternateScreen ?? false
+        root.lastAppliedAlternateScreen = alt
+        if alt, !wasAlt {
+            DispatchQueue.main.async { root.focusTerminal() }
         }
-        // Grid recalculation happens via layout() on frame change — not here.
     }
 
     final class Coordinator: NSObject, TerminalInputHandling {
@@ -66,6 +69,16 @@ struct TerminalView: NSViewRepresentable {
         }
         func sendChatExit() { onChatExit?() }
         func sendChatEnter(content: String) { onChatEnter?(content) }
+    }
+}
+
+@MainActor
+final class TerminalViewController: NSViewController {
+    let terminalRoot = TerminalContainerView()
+
+    override func loadView() {
+        terminalRoot.autoresizingMask = [.width, .height]
+        view = terminalRoot
     }
 }
 
@@ -109,23 +122,40 @@ struct TerminalSelection {
     }
 }
 
+// MARK: - Scroll view (do not take keyboard focus)
+
+private final class TerminalScrollView: NSScrollView {
+    override var acceptsFirstResponder: Bool { false }
+}
+
 // MARK: - Container View
 
 @MainActor
 final class TerminalContainerView: NSView {
     private let effectView = NSVisualEffectView()
-    private let scrollView = NSScrollView()
+    private let scrollView = TerminalScrollView()
     let gridView = TerminalGridView()
     private weak var handler: TerminalInputHandling?
     private(set) var appliedAppearance = TerminalAppearance.default
     private(set) var appliedTheme = BuiltinThemes.all.last!
+    /// Tracks alternate-screen state across SwiftUI updates so we only grab focus when entering it.
+    var lastAppliedAlternateScreen: Bool?
+
+    private weak var observedKeyWindow: NSWindow?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        autoresizingMask = [.width, .height]
+        // Help Auto Layout / SwiftUI sizing: expand to fill proposed size instead of hugging 0×0.
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.defaultLow, for: .vertical)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .vertical)
 
         effectView.blendingMode = .behindWindow
         effectView.state = .active
+        effectView.autoresizingMask = [.width, .height]
         addSubview(effectView)
 
         scrollView.drawsBackground = false
@@ -133,6 +163,7 @@ final class TerminalContainerView: NSView {
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
+        scrollView.autoresizingMask = [.width, .height]
 
         gridView.containerView = self
         scrollView.documentView = gridView
@@ -157,17 +188,24 @@ final class TerminalContainerView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        
+
+        if let w = observedKeyWindow {
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: w)
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: w)
+        }
+        observedKeyWindow = window
+
         // Focus event reporting (mode 1004)
         if let window {
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeKey), name: NSWindow.didBecomeKeyNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowDidResignKey), name: NSWindow.didResignKeyNotification, object: window)
         }
-        
-        // Always ensure terminal becomes first responder for traditional terminal mode
+
+        // Ensure the PTY view can receive keys after attach (SwiftUI often leaves the window
+        // or a focus host as first responder).
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            Log.debug("focus", "viewDidMoveToWindow - attempting to make gridView first responder")
+            guard let self else { return }
+            Log.debug("focus", "viewDidMoveToWindow — makeFirstResponder gridView")
             let success = self.window?.makeFirstResponder(self.gridView) ?? false
             Log.debug("focus", "makeFirstResponder result: \(success)")
         }
@@ -175,9 +213,9 @@ final class TerminalContainerView: NSView {
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {
         Log.debug("focus", "windowDidBecomeKey")
-        // Ensure gridView becomes first responder when window becomes key
         DispatchQueue.main.async { [weak self] in
-            let success = self?.window?.makeFirstResponder(self?.gridView) ?? false
+            guard let self else { return }
+            let success = self.window?.makeFirstResponder(self.gridView) ?? false
             Log.debug("focus", "windowDidBecomeKey makeFirstResponder: \(success)")
         }
         if gridView.buffer?.focusEventMode == true {
@@ -206,7 +244,7 @@ final class TerminalContainerView: NSView {
         let success = window.makeFirstResponder(gridView)
         Log.debug("focus", "focusTerminal result: \(success)")
     }
-    
+
     override func becomeFirstResponder() -> Bool {
         Log.debug("focus", "TerminalContainerView becomeFirstResponder")
         // Forward to gridView
@@ -226,8 +264,10 @@ final class TerminalContainerView: NSView {
         wantsLayer = true
         layer?.backgroundColor = theme.palette.background.withAlpha(appearance.opacity).nsColor.cgColor
 
+        // `blur` only selects material strength — never drive `alphaValue` from it, or blur=0
+        // makes the whole effect subtree (scroll view + grid) invisible while the PTY still runs.
         effectView.material = appearance.blur > 0.55 ? .hudWindow : .underWindowBackground
-        effectView.alphaValue = appearance.blur
+        effectView.alphaValue = 1
         effectView.wantsLayer = true
         effectView.layer?.backgroundColor = theme.palette.background.withAlpha(appearance.opacity).nsColor.cgColor
 
@@ -235,7 +275,6 @@ final class TerminalContainerView: NSView {
     }
 
     func updateBuffer(_ buffer: TerminalBuffer) {
-        let shouldFollowTail = isScrolledNearBottom()
         gridView.buffer = buffer
         gridView.needsDisplay = true
 
@@ -244,10 +283,16 @@ final class TerminalContainerView: NSView {
         // Add extra padding at bottom so cursor/prompt isn't hidden at edge
         let bottomPadding: CGFloat = 8
         let docHeight = max(CGFloat(totalLines) * lineHeight + bottomPadding, scrollView.contentView.bounds.height)
-        gridView.frame = NSRect(x: 0, y: 0, width: scrollView.contentView.bounds.width, height: docHeight)
+        let docWidth = max(scrollView.contentView.bounds.width, 1)
+        gridView.frame = NSRect(x: 0, y: 0, width: docWidth, height: docHeight)
 
+        // Decide follow-tail using the *actual* visible rect in document space. The old check
+        // compared doc height to clip height only, so it almost never scrolled — the prompt
+        // stayed on the last row below the viewport (blank black terminal).
+        let shouldFollowTail = isScrolledNearBottom(documentHeight: docHeight)
         if shouldFollowTail {
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, docHeight - scrollView.contentView.bounds.height)))
+            let clipH = scrollView.contentView.bounds.height
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, docHeight - clipH)))
         }
     }
 
@@ -262,11 +307,16 @@ final class TerminalContainerView: NSView {
         handler?.resize(columns: UInt16(columns), rows: UInt16(rows))
     }
 
-    private func isScrolledNearBottom() -> Bool {
-        guard gridView.frame.height > 0 else { return true }
-        let visibleMaxY = scrollView.contentView.bounds.maxY
-        let contentMaxY = gridView.frame.maxY
-        return contentMaxY - visibleMaxY < gridView.cellHeight * 2
+    /// `documentHeight` should match `gridView.frame.height` for this update.
+    private func isScrolledNearBottom(documentHeight docH: CGFloat) -> Bool {
+        let ch = gridView.cellHeight
+        guard ch > 0 else { return true }
+        let clipH = scrollView.contentView.bounds.height
+        if clipH <= 0 { return true }
+        if docH <= clipH + 0.5 { return true }
+        let vis = scrollView.documentVisibleRect
+        if vis.height <= 0 { return true }
+        return (docH - vis.maxY) <= ch * 2 + 1
     }
 }
 
@@ -405,6 +455,8 @@ final class TerminalGridView: NSView {
         let totalScrollback = scrollbackLines.count
         let columns = buffer.columns
         let rows = buffer.rows
+
+        guard cellWidth > 0, cellHeight > 0, rows > 0, columns > 0 else { return }
 
         let firstVisibleLine = max(0, Int(dirtyRect.minY / cellHeight))
         let lastVisibleLine = min(totalScrollback + rows - 1, Int(dirtyRect.maxY / cellHeight) + 1)
@@ -586,7 +638,7 @@ final class TerminalGridView: NSView {
             if event.keyCode == 36 {
                 // Check if local buffer starts with /chat command
                 let trimmed = localLineBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.lowercased() == "/chat-exit" {
+                if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chat-eixt" {
                     localLineBuffer = ""
                     inputHandler?.sendChatExit()
                     return

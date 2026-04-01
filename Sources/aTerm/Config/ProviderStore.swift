@@ -6,6 +6,8 @@ struct ProviderStore {
         var defaultProviderID: String?
         var defaultModelID: String?
         var oauthClientIDs: [String: String] = [:]
+        /// Models the user added for built-in provider IDs (merged at load; baseline comes from `BuiltinProviders`).
+        var builtinExtraModels: [String: [ModelDefinition]]?
     }
 
     private let fileManager = FileManager.default

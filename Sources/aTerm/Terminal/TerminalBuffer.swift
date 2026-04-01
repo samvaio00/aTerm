@@ -187,9 +187,18 @@ final class TerminalBuffer {
     var lastCommandExitCode: Int?
     var lastCommandDuration: Double?
 
+    /// Column where user typing begins after the prompt (set by OSC 133 B when shell integration emits it).
+    private(set) var shellInputStartColumn: Int?
+
     func markPromptStart() {
+        shellInputStartColumn = nil
         let absoluteLine = mainScrollback.count + cursorY
         promptMarks.append(PromptMark(scrollbackLine: absoluteLine))
+        markDirty()
+    }
+
+    func markPromptInputStart() {
+        shellInputStartColumn = cursorX
         markDirty()
     }
 
@@ -200,6 +209,54 @@ final class TerminalBuffer {
             promptMarks[promptMarks.count - 1].exitCode = exitCode
             promptMarks[promptMarks.count - 1].duration = duration
         }
+    }
+
+    /// Text from the active screen row, between `startColumn` and `endColumn` (document columns).
+    private static func string(from row: [TerminalCell], startColumn: Int, endColumn: Int) -> String {
+        var result = ""
+        var col = max(0, startColumn)
+        let end = min(endColumn, row.count)
+        while col < end {
+            let cell = row[col]
+            if cell.width == 0 {
+                col += 1
+                continue
+            }
+            result.append(cell.character)
+            col += Int(cell.width)
+        }
+        return result
+    }
+
+    /// User-typed portion of the current line for smart submit (classification), using OSC 133 B when available.
+    func userInputForSmartClassification() -> String {
+        guard !isAlternateScreen else { return "" }
+        guard cursorY >= 0 && cursorY < rows else { return "" }
+        let row = screen[cursorY]
+        let endCol = min(cursorX, columns)
+        let startCol: Int
+        if let marked = shellInputStartColumn, marked >= 0, marked <= endCol {
+            startCol = marked
+        } else {
+            startCol = 0
+        }
+        let raw = Self.string(from: row, startColumn: startCol, endColumn: endCol)
+        if shellInputStartColumn != nil {
+            return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return Self.approximateUserInputFromDisplayedLine(raw)
+    }
+
+    /// Strip common zsh/bash prompt tails so classification sees only what the user typed.
+    private static func approximateUserInputFromDisplayedLine(_ line: String) -> String {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let markers = ["❯ ", "➜ ", "» ", "% ", "$ ", "# ", "> "]
+        for m in markers {
+            if let r = trimmed.range(of: m, options: .backwards) {
+                return String(trimmed[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return trimmed
     }
 
     // Dirty tracking for efficient rendering

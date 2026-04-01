@@ -5,8 +5,8 @@ struct ProfilesSettingsTab: View {
     @State private var newProfileName = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            List {
+        Form {
+            Section("Profiles") {
                 ForEach(appModel.profiles) { profile in
                     HStack {
                         Text(profile.name)
@@ -14,35 +14,33 @@ struct ProfilesSettingsTab: View {
                         Spacer()
                         if appModel.defaultProfileID == profile.id {
                             Text("Default")
-                                .font(.system(size: 11))
+                                .font(.caption.weight(.medium))
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 2)
                                 .background(.blue.opacity(0.15))
                                 .clipShape(Capsule())
                         } else {
-                            Button("Set Default") {
+                            Button("Set default") {
                                 appModel.setDefaultProfile(profile.id)
                             }
                             .buttonStyle(.borderless)
-                            .font(.system(size: 11))
                         }
                     }
                 }
             }
-            .listStyle(.inset)
-
-            HStack {
-                TextField("New profile name", text: $newProfileName)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 250)
-                Button("Create from Current Tab") {
+            Section("New profile") {
+                LabeledContent("Name") {
+                    TextField("Profile name", text: $newProfileName)
+                        .textFieldStyle(.roundedBorder)
+                }
+                Button("Create from current tab") {
                     guard !newProfileName.isEmpty else { return }
                     appModel.createProfileFromSelectedTab(named: newProfileName)
                     newProfileName = ""
                 }
                 .disabled(newProfileName.isEmpty)
             }
-            .padding(.horizontal, 8)
         }
+        .formStyle(.grouped)
     }
 }

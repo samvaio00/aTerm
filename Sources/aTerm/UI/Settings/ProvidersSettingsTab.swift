@@ -7,8 +7,13 @@ struct ProvidersSettingsTab: View {
 
     var body: some View {
         HSplitView {
-            // Provider list
             VStack(alignment: .leading, spacing: 0) {
+                Text("Providers")
+                    .font(.headline)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+
                 List(appModel.availableProviders, selection: $selectedProviderID) { provider in
                     HStack(spacing: 8) {
                         Circle()
@@ -26,34 +31,47 @@ struct ProvidersSettingsTab: View {
                 .listStyle(.sidebar)
 
                 Divider()
-                HStack {
-                    Button(action: { isAddingNew = true }) {
-                        Label("Add Provider", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderless)
-                    .padding(8)
-                    Spacer()
+                Button {
+                    isAddingNew = true
+                    selectedProviderID = nil
+                } label: {
+                    Label("Add custom provider", systemImage: "plus.circle.fill")
                 }
+                .buttonStyle(.borderless)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(minWidth: 200, maxWidth: 240)
+            .frame(minWidth: 220, idealWidth: 240, maxWidth: 280)
 
-            // Detail / editor
-            if isAddingNew {
-                ProviderEditorView(provider: nil, onSave: { provider, secret in
-                    try? appModel.upsertProvider(provider, secret: secret)
-                    isAddingNew = false
-                    selectedProviderID = provider.id
-                }, onCancel: { isAddingNew = false })
-            } else if let id = selectedProviderID, let provider = appModel.provider(for: id) {
-                ProviderEditorView(provider: provider, onSave: { updated, secret in
-                    try? appModel.upsertProvider(updated, secret: secret)
-                }, onCancel: { selectedProviderID = nil })
-            } else {
-                VStack {
-                    Spacer()
-                    Text("Select a provider or add a new one")
-                        .foregroundStyle(.secondary)
-                    Spacer()
+            Group {
+                if isAddingNew {
+                    ProviderEditorView(provider: nil, onSave: { provider, secret in
+                        try? appModel.upsertProvider(provider, secret: secret)
+                        isAddingNew = false
+                        selectedProviderID = provider.id
+                    }, onCancel: {
+                        isAddingNew = false
+                    })
+                } else if let id = selectedProviderID, let provider = appModel.provider(for: id) {
+                    ProviderEditorView(provider: provider, onSave: { updated, secret in
+                        try? appModel.upsertProvider(updated, secret: secret)
+                    }, onCancel: { selectedProviderID = nil })
+                } else {
+                    VStack(spacing: 8) {
+                        Spacer()
+                        Image(systemName: "network")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.tertiary)
+                        Text("Select a provider")
+                            .font(.headline)
+                        Text("Choose a built-in provider to add API keys or custom models, or create a new OpenAI-compatible endpoint.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 320)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity)
                 }
             }
         }
@@ -97,6 +115,22 @@ struct ProviderEditorView: View {
 
     private var isBuiltin: Bool { provider?.isBuiltin ?? false }
 
+    /// Built-in catalog model IDs for this provider (user-added models are not in this set).
+    private var builtinBaselineModelIDs: Set<String> {
+        guard let id = provider?.id else { return [] }
+        let baseline = BuiltinProviders.all.first(where: { $0.id == id })?.models ?? []
+        return Set(baseline.map(\.id))
+    }
+
+    private func canRemoveModel(_ model: ModelDefinition) -> Bool {
+        if !isBuiltin { return true }
+        return !builtinBaselineModelIDs.contains(model.id)
+    }
+
+    private var canSaveNewProvider: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// Provider with the current OAuth client ID from the text field applied
     private var providerWithCurrentOAuthClientID: ModelProvider? {
         guard var p = provider, var oauth = p.oauthConfig else { return provider }
@@ -107,152 +141,200 @@ struct ProviderEditorView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                Text(provider == nil ? "New Provider" : name)
-                    .font(.title2.bold())
-
-                Group {
-                    LabeledContent("ID") {
-                        TextField("provider-slug", text: $slug)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(isBuiltin)
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text(provider == nil ? "New provider" : name)
+                        .font(.title2.bold())
+                    if isBuiltin {
+                        Text("Built-in")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(.quaternary.opacity(0.5))
+                            .clipShape(Capsule())
                     }
-                    LabeledContent("Name") {
-                        TextField("Provider Name", text: $name)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(isBuiltin)
-                    }
-                    LabeledContent("Endpoint") {
-                        TextField("https://api.example.com/v1/chat/completions", text: $endpoint)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(isBuiltin)
-                    }
-                    LabeledContent("Auth Type") {
-                        Picker("", selection: $authType) {
-                            ForEach(AuthType.allCases) { type in
-                                Text(type.displayName).tag(type)
-                            }
-                        }
-                        .labelsHidden()
-                        .disabled(isBuiltin)
-                    }
-                    LabeledContent("API Format") {
-                        Picker("", selection: $apiFormat) {
-                            Text("OpenAI Compatible").tag(APIFormat.openAICompatible)
-                            Text("Anthropic").tag(APIFormat.anthropic)
-                            Text("Gemini").tag(APIFormat.gemini)
-                            Text("Custom").tag(APIFormat.custom)
-                        }
-                        .labelsHidden()
-                        .disabled(isBuiltin)
-                    }
+                    Spacer()
+                    Button("Cancel", role: .cancel) { onCancel() }
+                        .keyboardShortcut(.cancelAction)
                 }
 
-                Divider()
-
-                if authType == .oauthToken, provider?.oauthConfig != nil {
-                    if provider?.oauthConfig?.clientIDRequired == true {
-                        LabeledContent("OAuth Client ID") {
-                            TextField("Enter your OAuth client ID", text: $oauthClientID)
+                GroupBox("Connection") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        LabeledContent("ID") {
+                            TextField("my-provider", text: $slug)
                                 .textFieldStyle(.roundedBorder)
+                                .disabled(isBuiltin)
                         }
-                        Text("Create at console.cloud.google.com → APIs & Services → Credentials → OAuth 2.0 Client ID (Desktop app).")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                    OAuthSignInSection(provider: providerWithCurrentOAuthClientID)
-                } else if authType != .none {
-                    LabeledContent("API Key / Token") {
-                        SecureField("Paste your API key", text: $secret)
-                            .textFieldStyle(.roundedBorder)
-                    }
-                    Text("Stored securely in macOS Keychain. Never written to disk.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-
-                Divider()
-
-                Text("Models").font(.headline)
-                ForEach(models) { model in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(model.name).fontWeight(.medium)
-                            Text(model.id)
-                                .font(.system(size: 11, design: .monospaced))
+                        if provider == nil {
+                            Text("Leave blank to derive from the name (lowercase, hyphens).")
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                        Spacer()
-                        if !isBuiltin {
-                            Button(role: .destructive) {
-                                models.removeAll { $0.id == model.id }
-                            } label: {
-                                Image(systemName: "minus.circle")
+                        LabeledContent("Name") {
+                            TextField("Provider Name", text: $name)
+                                .textFieldStyle(.roundedBorder)
+                                .disabled(isBuiltin)
+                        }
+                        LabeledContent("Endpoint") {
+                            TextField("https://api.example.com/v1/chat/completions", text: $endpoint)
+                                .textFieldStyle(.roundedBorder)
+                                .disabled(isBuiltin)
+                        }
+                        LabeledContent("Auth type") {
+                            Picker("", selection: $authType) {
+                                ForEach(AuthType.allCases) { type in
+                                    Text(type.displayName).tag(type)
+                                }
                             }
-                            .buttonStyle(.borderless)
+                            .labelsHidden()
+                            .frame(maxWidth: 220, alignment: .leading)
+                            .disabled(isBuiltin)
+                        }
+                        LabeledContent("API format") {
+                            Picker("", selection: $apiFormat) {
+                                Text("OpenAI compatible").tag(APIFormat.openAICompatible)
+                                Text("Anthropic").tag(APIFormat.anthropic)
+                                Text("Gemini").tag(APIFormat.gemini)
+                                Text("Custom").tag(APIFormat.custom)
+                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 220, alignment: .leading)
+                            .disabled(isBuiltin)
                         }
                     }
-                    .padding(.vertical, 2)
+                    .padding(4)
                 }
 
-                if !isBuiltin {
-                    HStack {
-                        TextField("Model ID", text: $modelID)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(maxWidth: 200)
-                        TextField("Display Name", text: $modelName)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(maxWidth: 200)
-                        Button("Add") {
-                            guard !modelID.isEmpty else { return }
-                            let displayName = modelName.isEmpty ? modelID : modelName
-                            models.append(ModelDefinition(id: modelID, name: displayName, contextWindow: 128_000, supportsStreaming: true))
-                            modelID = ""
-                            modelName = ""
-                        }
-                    }
-                    
-                    // Fetch models button for OpenAI-compatible endpoints
-                    if apiFormat == .openAICompatible || apiFormat == .custom {
-                        Button("Fetch Models from Endpoint") {
-                            fetchModelsFromEndpoint()
-                        }
-                        .disabled(endpoint.isEmpty || isFetchingModels)
-                        
-                        if isFetchingModels {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else if let fetchModelsError {
-                            Text(fetchModelsError)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.red)
-                        } else if !fetchedModels.isEmpty {
-                            Text("Found \(fetchedModels.count) models")
-                                .font(.system(size: 11))
+                GroupBox("Authentication") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if authType == .oauthToken, provider?.oauthConfig != nil {
+                            if provider?.oauthConfig?.clientIDRequired == true {
+                                LabeledContent("OAuth client ID") {
+                                    TextField("Enter your OAuth client ID", text: $oauthClientID)
+                                        .textFieldStyle(.roundedBorder)
+                                }
+                                Text("Create at console.cloud.google.com → APIs & Services → Credentials → OAuth 2.0 Client ID (Desktop app).")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            OAuthSignInSection(provider: providerWithCurrentOAuthClientID)
+                        } else if authType != .none {
+                            LabeledContent("API key / token") {
+                                SecureField("Paste your API key", text: $secret)
+                                    .textFieldStyle(.roundedBorder)
+                            }
+                            Text("Stored in macOS Keychain only.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("No credentials required for this provider.")
+                                .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    .padding(4)
                 }
 
-                Divider()
+                GroupBox("Models") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(isBuiltin
+                             ? "Add models by ID, or fetch from the endpoint. Catalog models cannot be removed."
+                             : "Define models manually, fetch from the endpoint, or both.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if models.isEmpty {
+                            Text("No models yet — add at least one, or use “Fetch models”.")
+                                .font(.subheadline)
+                                .foregroundStyle(.tertiary)
+                        }
+
+                        ForEach(models) { model in
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(model.name).fontWeight(.medium)
+                                    Text(model.id)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if canRemoveModel(model) {
+                                    Button(role: .destructive) {
+                                        models.removeAll { $0.id == model.id }
+                                    } label: {
+                                        Image(systemName: "minus.circle.fill")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("Remove model")
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            TextField("Model ID", text: $modelID)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 140, idealWidth: 180)
+                            TextField("Display name (optional)", text: $modelName)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 140, idealWidth: 200)
+                            Button("Add model") {
+                                let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !trimmed.isEmpty else { return }
+                                let displayName = modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+                                let finalName = displayName.isEmpty ? trimmed : displayName
+                                let exists = models.contains { $0.id == trimmed }
+                                guard !exists else { return }
+                                models.append(ModelDefinition(id: trimmed, name: finalName, contextWindow: 128_000, supportsStreaming: true))
+                                modelID = ""
+                                modelName = ""
+                            }
+                            .disabled(modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+
+                        if apiFormat == .openAICompatible || apiFormat == .custom {
+                            HStack(spacing: 8) {
+                                Button("Fetch models from endpoint") {
+                                    fetchModelsFromEndpoint()
+                                }
+                                .disabled(endpoint.isEmpty || isFetchingModels)
+                                if isFetchingModels {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                            }
+                            if let fetchModelsError {
+                                Text(fetchModelsError)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            } else if !fetchedModels.isEmpty {
+                                Text("Merged \(fetchedModels.count) model(s) from the server.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(4)
+                }
 
                 HStack(spacing: 12) {
-                    Button("Test Connection") {
+                    Button("Test connection") {
                         testConnection()
                     }
                     .disabled(isTesting)
 
                     if let testResult {
                         Text(testResult)
-                            .font(.system(size: 12))
-                            .foregroundColor(testResult.contains("ms") ? .primary : .red)
-                            .lineLimit(2)
+                            .font(.caption)
+                            .foregroundStyle(testResult.contains("ms") ? Color.primary : Color.red)
+                            .lineLimit(3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
-                    Spacer()
+                    Spacer(minLength: 8)
 
                     if provider != nil, !isBuiltin {
-                        Button("Delete", role: .destructive) {
+                        Button("Delete provider", role: .destructive) {
                             if let id = provider?.id {
                                 appModel.deleteProvider(id)
                                 onCancel()
@@ -261,36 +343,48 @@ struct ProviderEditorView: View {
                     }
 
                     Button("Save") {
-                        var oauthConfig = provider?.oauthConfig
-                        if let existing = oauthConfig, !oauthClientID.isEmpty {
-                            oauthConfig = OAuthConfig(
-                                clientID: oauthClientID,
-                                authURL: existing.authURL,
-                                tokenURL: existing.tokenURL,
-                                scopes: existing.scopes,
-                                redirectScheme: existing.redirectScheme,
-                                clientIDRequired: existing.clientIDRequired
-                            )
-                        }
-                        let updated = ModelProvider(
-                            id: slug.isEmpty ? UUID().uuidString : slug,
-                            name: name,
-                            endpoint: endpoint,
-                            authType: authType,
-                            apiFormat: apiFormat,
-                            models: models,
-                            customHeaders: provider?.customHeaders ?? [:],
-                            isBuiltin: false,
-                            oauthConfig: oauthConfig
-                        )
-                        onSave(updated, secret.isEmpty ? nil : secret)
+                        saveProvider()
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(slug.isEmpty && !isBuiltin)
+                    .disabled(provider == nil && !canSaveNewProvider)
                 }
             }
             .padding(20)
         }
+    }
+
+    private func saveProvider() {
+        var oauthConfig = provider?.oauthConfig
+        if let existing = oauthConfig, !oauthClientID.isEmpty {
+            oauthConfig = OAuthConfig(
+                clientID: oauthClientID,
+                authURL: existing.authURL,
+                tokenURL: existing.tokenURL,
+                scopes: existing.scopes,
+                redirectScheme: existing.redirectScheme,
+                clientIDRequired: existing.clientIDRequired
+            )
+        }
+        let trimmedSlug = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let derivedID: String = {
+            if !trimmedSlug.isEmpty { return trimmedSlug }
+            let fromName = trimmedName.lowercased().replacingOccurrences(of: " ", with: "-")
+            if !fromName.isEmpty { return fromName }
+            return UUID().uuidString
+        }()
+        let updated = ModelProvider(
+            id: derivedID,
+            name: trimmedName.isEmpty ? derivedID : trimmedName,
+            endpoint: endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
+            authType: authType,
+            apiFormat: apiFormat,
+            models: models,
+            customHeaders: provider?.customHeaders ?? [:],
+            isBuiltin: provider?.isBuiltin ?? false,
+            oauthConfig: oauthConfig
+        )
+        onSave(updated, secret.isEmpty ? nil : secret)
     }
 
     private func testConnection() {

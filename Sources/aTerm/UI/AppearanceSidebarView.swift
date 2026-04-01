@@ -17,8 +17,9 @@ struct AppearanceSidebarView: View {
     @State private var isFetchingModels = false
     @State private var fetchModelsError: String?
 
-    private var availableFonts: [String] {
-        FontSupport.monospaceFontNames()
+    /// Includes current tab fonts so `Picker` selection always matches a tag (see FontSupport).
+    private var fontPickerOptions: [String] {
+        FontSupport.monospaceFontNamesMerged(with: [tab.appearance.fontName, tab.appearance.nonASCIIFontName])
     }
 
     var body: some View {
@@ -114,13 +115,13 @@ struct AppearanceSidebarView: View {
                 .font(.headline)
 
             Picker("ASCII", selection: asciiFontBinding) {
-                ForEach(availableFonts, id: \.self) { fontName in
+                ForEach(fontPickerOptions, id: \.self) { fontName in
                     Text(fontName).tag(fontName)
                 }
             }
 
             Picker("Non-ASCII", selection: nonASCIIFontBinding) {
-                ForEach(availableFonts, id: \.self) { fontName in
+                ForEach(fontPickerOptions, id: \.self) { fontName in
                     Text(fontName).tag(fontName)
                 }
             }
@@ -297,7 +298,13 @@ struct AppearanceSidebarView: View {
                 .font(.headline)
 
             LabeledSlider(title: "Opacity", value: opacityBinding, range: 0.3...1)
-            LabeledSlider(title: "Blur", value: blurBinding, range: 0...1)
+            VStack(alignment: .leading, spacing: 4) {
+                LabeledSlider(title: "Frost", value: blurBinding, range: 0...1)
+                Text("Background material only. 0 is still fully visible; use Opacity to dim the pane.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             Picker("Cursor", selection: cursorStyleBinding) {
                 ForEach(CursorStyle.allCases) { cursorStyle in

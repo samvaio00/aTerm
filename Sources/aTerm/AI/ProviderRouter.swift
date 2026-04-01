@@ -59,14 +59,24 @@ struct ProviderRouter {
                             return
                         }
                         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard trimmed.hasPrefix("data:") else { continue }
-                        let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                        if payload == "[DONE]" {
-                            continuation.finish()
-                            return
+                        guard !trimmed.isEmpty else { continue }
+
+                        let payload: String
+                        if trimmed.hasPrefix("data:") {
+                            let p = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                            if p == "[DONE]" {
+                                continuation.finish()
+                                return
+                            }
+                            payload = String(p)
+                        } else if trimmed.hasPrefix("{") {
+                            // Some OpenAI-compatible servers stream raw JSON lines (NDJSON) without the SSE "data:" prefix
+                            payload = trimmed
+                        } else {
+                            continue
                         }
 
-                        if let chunk = parseStreamingChunk(String(payload), provider: provider) {
+                        if let chunk = parseStreamingChunk(payload, provider: provider), !chunk.isEmpty {
                             continuation.yield(chunk)
                         }
                     }
@@ -486,11 +496,26 @@ struct ProviderRouter {
             return nil
         }
 
+        if let error = dictionary["error"] as? [String: Any],
+           let message = error["message"] as? String {
+            return "[API error: \(message)]"
+        }
+
         switch provider.apiFormat {
         case .openAICompatible, .custom:
             let choices = dictionary["choices"] as? [[String: Any]]
-            let delta = choices?.first?["delta"] as? [String: Any]
-            return delta?["content"] as? String
+            guard let delta = choices?.first?["delta"] as? [String: Any] else { return nil }
+            if let s = delta["content"] as? String, !s.isEmpty { return s }
+            if let parts = delta["content"] as? [[String: Any]] {
+                for part in parts {
+                    if let t = part["text"] as? String, !t.isEmpty { return t }
+                }
+            }
+            if let msg = delta["message"] as? [String: Any],
+               let c = msg["content"] as? String, !c.isEmpty {
+                return c
+            }
+            return nil
         case .anthropic:
             let type = dictionary["type"] as? String
             if type == "content_block_delta",

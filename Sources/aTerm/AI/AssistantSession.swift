@@ -122,11 +122,23 @@ struct RichMessage {
 @MainActor
 final class ConversationHistory {
     private(set) var messages: [RichMessage] = []
-    private let maxMessages = 20
+    private let maxMessages: Int
 
-    /// Flat ChatMessage array for simple (non-tool) API calls
+    init(maxMessages: Int = 20) {
+        self.maxMessages = maxMessages
+    }
+
+    /// Flat ChatMessage array for simple (non-tool) API calls.
+    /// Drops empty user/assistant entries so providers don't see blank turns.
     var simplifiedMessages: [ChatMessage] {
-        messages.map { ChatMessage(role: $0.role, content: $0.text) }
+        messages.compactMap { msg in
+            if msg.role == "system" {
+                return ChatMessage(role: "system", content: msg.text)
+            }
+            let trimmed = msg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return ChatMessage(role: msg.role, content: msg.text)
+        }
     }
 
     func addSystemMessage(_ content: String) {

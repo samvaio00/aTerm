@@ -3,12 +3,13 @@ import SwiftUI
 struct GeneralSettingsTab: View {
     @EnvironmentObject private var appModel: AppModel
     @AppStorage("appThemePreference") private var themePreference: String = AppThemePreference.system.rawValue
+    @State private var resolvedShellPath = "/bin/zsh"
 
     var body: some View {
         Form {
             Section("Shell") {
                 LabeledContent("Default Shell") {
-                    Text((try? ShellLocator.detectZsh()) ?? "/bin/zsh")
+                    Text(resolvedShellPath)
                         .font(.system(size: 12, design: .monospaced))
                         .textSelection(.enabled)
                 }
@@ -46,6 +47,9 @@ struct GeneralSettingsTab: View {
                         .foregroundStyle(.secondary)
                 }
             }
+        }
+        .task {
+            resolvedShellPath = (try? ShellLocator.detectZsh()) ?? "/bin/zsh"
         }
     }
 }

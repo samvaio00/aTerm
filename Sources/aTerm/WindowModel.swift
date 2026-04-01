@@ -318,6 +318,10 @@ final class WindowModel: ObservableObject, Identifiable {
                     await self.appModel.answerChatQuery(message, for: pane)
                 }
             }
+            pane.onSubmitSmartLine = { [weak self, weak pane] line in
+                guard let self, let pane else { return }
+                self.appModel.submitSmartLineFromPrompt(line, for: pane)
+            }
         }
     }
 

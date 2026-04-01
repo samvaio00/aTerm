@@ -80,6 +80,11 @@ enum ZshRuntime {
         add-zsh-hook precmd aterm_emit_terminal_state
         add-zsh-hook chpwd aterm_emit_terminal_state
         aterm_emit_terminal_state
+
+        # Invisible OSC 133 B after PS1 so aTerm knows where user input starts (smart line classification).
+        if [[ -o interactive ]] && [[ "${PS1:-}" != *133;B* ]]; then
+          PS1="${PS1}"$'%{\\033]133;B\\a%}'
+        fi
         """
     }
 }

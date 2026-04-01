@@ -83,6 +83,12 @@ struct KeybindingsSettingsTab: View {
             }
             .padding(12)
         }
+        .onDisappear {
+            // Leaving Shortcuts while "Record" is active would remove KeyRecorderNSView without a clean
+            // resign in some SwiftUI recycle paths — always cancel so the main window can take keys again.
+            editingBindingID = nil
+            pendingKeyDisplay = nil
+        }
     }
 }
 
@@ -93,7 +99,6 @@ struct KeyRecorderView: NSViewRepresentable {
     func makeNSView(context: Context) -> KeyRecorderNSView {
         let view = KeyRecorderNSView()
         view.onKeyDown = onKeyDown
-        DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
         return view
     }
 
@@ -101,10 +106,40 @@ struct KeyRecorderView: NSViewRepresentable {
         nsView.onKeyDown = onKeyDown
     }
 
-    class KeyRecorderNSView: NSView {
+    static func dismantleNSView(_ nsView: KeyRecorderNSView, coordinator: ()) {
+        resignFirstResponderIfNeeded(nsView)
+    }
+
+    /// If this view is still first responder when torn down (e.g. user closed Settings mid-record),
+    /// AppKit can leave the key window with no valid target — the main terminal stops receiving keys.
+    private static func resignFirstResponderIfNeeded(_ nsView: KeyRecorderNSView) {
+        guard let window = nsView.window else { return }
+        if window.firstResponder === nsView {
+            window.makeFirstResponder(nil)
+        }
+    }
+
+    final class KeyRecorderNSView: NSView {
         var onKeyDown: ((NSEvent) -> Void)?
 
         override var acceptsFirstResponder: Bool { true }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            // `window` is still the old window when moving off-window — clear focus before detach.
+            if newWindow == nil, let w = window, w.firstResponder === self {
+                w.makeFirstResponder(nil)
+            }
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let w = self.window, w.firstResponder !== self else { return }
+                _ = w.makeFirstResponder(self)
+            }
+        }
 
         override func keyDown(with event: NSEvent) {
             // Only accept if a modifier is pressed (prevent bare letter captures)

@@ -798,7 +798,8 @@ final class VT100Parser {
 
         switch marker {
         case "A": buffer.markPromptStart()
-        case "B", "C": break // prompt end / command output start
+        case "B": buffer.markPromptInputStart() // user input begins after prompt
+        case "C": break // command output start
         case "D":
             let exitCode = parts.count > 1 ? Int(parts[1]) : nil
             buffer.markCommandFinished(exitCode: exitCode, duration: nil)
