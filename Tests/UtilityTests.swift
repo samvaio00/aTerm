@@ -269,14 +269,14 @@ struct ProfileTests {
     func terminalAppearanceDefault() {
         let appearance = TerminalAppearance.default
         
-        #expect(appearance.themeID == "custom-default")
-        #expect(appearance.fontSize == 13)
-        #expect(appearance.lineHeight == 1.18)
-        #expect(appearance.letterSpacing == 0)
-        #expect(appearance.opacity == 0.96)
-        #expect(appearance.blur == 0.45)
-        #expect(appearance.cursorStyle == .bar)
-        #expect(appearance.cursorBlink == false)
+        #expect(appearance.themeID == "modern")
+        #expect(appearance.fontSize == 18)
+        #expect(appearance.lineHeight == 1.25)
+        #expect(appearance.letterSpacing == 0.5)
+        #expect(appearance.opacity == 1.0)
+        #expect(appearance.blur == 0)
+        #expect(appearance.cursorStyle == .block)
+        #expect(appearance.cursorBlink == true)
         #expect(appearance.scrollbackSize == 10000)
     }
     
