@@ -6,9 +6,10 @@ on:
 
 jobs:
   macos-build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
@@ -32,35 +33,33 @@ jobs:
       - name: Create app bundle
         run: |
           APP_DIR="aTerm.app/Contents/MacOS"
-          mkdir -p "$APP_DIR"
+          RESOURCES_DIR="aTerm.app/Contents/Resources"
+          mkdir -p "$APP_DIR" "$RESOURCES_DIR"
+
           cp aTerm-universal "$APP_DIR/aTerm"
           cp Info.plist aTerm.app/Contents/Info.plist
 
-          # Copy resources
-          RESOURCES_DIR="aTerm.app/Contents/Resources"
-          mkdir -p "$RESOURCES_DIR"
           if [ -d Sources/aTerm/Resources ]; then
             cp -R Sources/aTerm/Resources/* "$RESOURCES_DIR/" 2>/dev/null || true
           fi
-          # Copy Swift package resource bundle if present
-          BUNDLE=$(find .build/release -name 'aTerm_aTerm.bundle' -maxdepth 1 2>/dev/null | head -1)
+
+          BUNDLE=$(find .build/arm64-apple-macosx/release -name 'aTerm_aTerm.bundle' -maxdepth 1 2>/dev/null | head -1)
+          if [ -n "$BUNDLE" ]; then
+            cp -R "$BUNDLE" "$RESOURCES_DIR/"
+          fi
 
       - name: Build Finder extension
         run: |
-          # Compile the Finder extension (requires FinderSync framework)
           EXT_DIR="aTerm.app/Contents/PlugIns/aTermFinderExtension.appex/Contents/MacOS"
           mkdir -p "$EXT_DIR"
           swiftc -target arm64-apple-macos13 \
             -framework Cocoa -framework FinderSync \
             -module-name aTermFinderExtension \
             Sources/aTermFinderExtension/FinderSync.swift \
-            -o "$EXT_DIR/aTermFinderExtension" 2>/dev/null || echo "Finder extension build skipped (FinderSync requires Xcode)"
-          if [ -f "$EXT_DIR/aTermFinderExtension" ]; then
-            cp Sources/aTermFinderExtension/Info.plist "aTerm.app/Contents/PlugIns/aTermFinderExtension.appex/Contents/Info.plist"
-          fi
-          if [ -n "$BUNDLE" ]; then
-            cp -R "$BUNDLE" "$RESOURCES_DIR/"
-          fi
+            -o "$EXT_DIR/aTermFinderExtension" 2>/dev/null \
+            && cp Sources/aTermFinderExtension/Info.plist \
+               "aTerm.app/Contents/PlugIns/aTermFinderExtension.appex/Contents/Info.plist" \
+            || echo "Finder extension build skipped (FinderSync requires Xcode)"
 
       - name: Sign with entitlements (ad-hoc)
         run: |
@@ -69,9 +68,16 @@ jobs:
             --sign - \
             aTerm.app
 
+      - name: Determine version
+        id: version
+        run: |
+          TAG=$(git tag --points-at HEAD | grep '^v' | head -1)
+          echo "name=${TAG:-dev-$(git rev-parse --short HEAD)}" >> "$GITHUB_OUTPUT"
+
       - name: Create DMG
         run: |
           brew install create-dmg || true
+          DMG_NAME="aTerm-${{ steps.version.outputs.name }}.dmg"
           create-dmg \
             --volname "aTerm" \
             --volicon "aTerm.app/Contents/Resources/AppIcon.icns" \
@@ -81,12 +87,13 @@ jobs:
             --icon "aTerm.app" 150 190 \
             --app-drop-link 450 190 \
             --no-internet-enable \
-            "aTerm-0.1.0.dmg" \
-            "aTerm.app" || \
-          hdiutil create -volname "aTerm" -srcfolder "aTerm.app" -ov -format UDZO "aTerm-0.1.0.dmg"
+            "$DMG_NAME" \
+            "aTerm.app" \
+          || hdiutil create -volname "aTerm" -srcfolder "aTerm.app" -ov -format UDZO "$DMG_NAME"
+          echo "dmg_name=$DMG_NAME" >> "$GITHUB_ENV"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: aTerm-dmg
-          path: aTerm-0.1.0.dmg
+          path: ${{ env.dmg_name }}
