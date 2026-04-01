@@ -44,17 +44,57 @@ aTerm runs a genuine PTY-backed shell, not a wrapped web view.
 
 ### AI and input classification
 
-The SmartInputBar at the bottom of every pane routes what you type to the right place automatically.
+Everything happens at the shell prompt — there is no separate input bar. aTerm classifies what you type and routes it automatically between three modes.
+
+#### 1. Shell commands — run directly
+
+Anything that looks like a shell command is sent straight to the PTY as normal:
 
 ```
-$ ls -la            → runs as a shell command
-$ show me open ports → generates the right shell command, lets you review and run it
-$ what does SIGPIPE mean → streams an AI answer with conversation history
+ls -la
+git status
+docker ps -a
+npm run dev
 ```
+
+#### 2. Natural language — generates a shell command
+
+Plain English descriptions are turned into shell commands. The generated command is shown in a card for you to review, edit, and run — or dismiss with Escape:
+
+```
+show me open ports
+find all files modified in the last 24 hours
+kill the process using port 3000
+list docker containers sorted by size
+```
+
+#### 3. Chat mode — pure AI conversation, unrelated to the shell
+
+Type `/chat` at the prompt to enter a persistent AI chat session. In chat mode, everything you type goes directly to the model — nothing runs in the shell, no commands are generated. Use it for questions, explanations, code review, debugging help, or any general conversation with the AI:
+
+```
+/chat
+```
+
+Once in chat mode, just type:
+
+```
+explain what a segfault is
+review this function for bugs: [paste code]
+what's the difference between SIGTERM and SIGKILL
+```
+
+To leave chat mode and return to normal smart-routing, type:
+
+```
+/chat-exit
+```
+
+---
 
 - **Input classifier** — heuristics cover common patterns instantly; an LLM call handles ambiguous input; a disambiguation bar appears when confidence is low
 - **Prefix overrides** — `$` forces terminal, `>` forces AI-to-shell command generation, `!` forces a query
-- **Streaming completions** — token-by-token output for both shell generation and query flows
+- **Streaming completions** — token-by-token output for both shell generation and chat flows
 - **Conversation history** — up to 20 turns of multi-turn context per pane, independent per pane
 - **AI-to-shell card** — generated commands are shown, editable, and executed on Enter; dismissed with Escape
 - **Per-tab model selection** — ⌘M opens a floating model picker to switch provider and model without leaving the terminal
@@ -95,7 +135,7 @@ One-click launch for common AI coding CLIs. aTerm detects whether each agent is 
 
 Detected agents: **Claude Code**, **Kimi Code**, **Codex**, **Aider**, **OpenClaw**, and more.
 
-Agent tabs get a distinct UI mode — no SmartInputBar, input goes directly to the agent process, and an exit banner offers one-click restart.
+Agent tabs get a distinct UI mode — input goes directly to the agent process at the prompt, and an exit banner offers one-click restart.
 
 ### Tabs and split panes
 
@@ -189,12 +229,13 @@ bash install.sh
 ## Quick start
 
 1. **Launch aTerm.** A new `zsh` session opens automatically.
-2. Type any shell command in the SmartInputBar at the bottom and press **Return** — it runs normally.
-3. Type a plain-language description like `list all running docker containers` and press **Return** — aTerm generates the shell command and shows it in a card for you to review and run.
-4. Type a question like `what does exit code 137 mean` and press **Return** — aTerm streams an AI answer.
-5. Press **⌘,** to open Settings and add an AI provider key.
-6. Press **⌘M** to pick a model per tab.
-7. Press **⌘P** to open the command palette.
+2. **Run a shell command** — type `ls -la` at the prompt and press **Return**. It runs in the shell as normal.
+3. **Generate a command from plain English** — type `list all running docker containers` and press **Return**. aTerm generates the shell command and shows it in a card to review, edit, and run — or press **Escape** to dismiss.
+4. **Enter chat mode** — type `/chat` at the prompt and press **Return**. You're now in a direct AI conversation, completely separate from the shell. Ask anything, paste code, ask follow-up questions. Nothing runs in the shell.
+5. **Exit chat mode** — type `/chat-exit` and press **Return** to return to normal smart-routing.
+6. Press **⌘,** to open Settings and add an AI provider key.
+7. Press **⌘M** to pick a model per tab.
+8. Press **⌘P** to open the command palette.
 
 ---
 
