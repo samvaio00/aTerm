@@ -50,7 +50,7 @@ struct ProviderAdapterTests {
         
         #expect(provider?.authType == AuthType.none)
         #expect(provider?.apiFormat == .openAICompatible)
-        #expect(provider?.endpoint == "http://localhost:11434/v1/chat/completions")
+        #expect(provider?.endpoint == "http://127.0.0.1:11434/v1/chat/completions")
     }
     
     @Test
