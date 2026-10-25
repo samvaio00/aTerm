@@ -582,9 +582,11 @@ final class AppModel: ObservableObject {
             // Auto-run the generated command unless it looks dangerous, in which case
             // keep the confirmation card so the user can review/edit.
             let generated = pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isBroad = generated.contains("cd ") || generated.contains(" /") || generated.contains(" ~") || generated.contains("~")
             if !generated.isEmpty,
                !generated.hasPrefix("Generation failed"),
-               !inputClassifier.isDangerousCommand(generated) {
+               !inputClassifier.isDangerousCommand(generated),
+               !isBroad {
                 pane.aiShellState = AIShellState()
                 pane.sendTerminalCommand(generated)
             }
@@ -1142,7 +1144,7 @@ final class AppModel: ObservableObject {
                 provider: provider,
                 modelID: modelID,
                 messages: [
-                    ChatMessage(role: "system", content: "Convert the request into a single shell command for zsh. Reply with only the command, no markdown, no explanation."),
+                    ChatMessage(role: "system", content: "Convert the request into a single safe zsh command for the CURRENT directory only. Reply with only the command, no markdown, no explanation. Never use cd. Never search or list paths outside the current directory. Use relative paths and prefer ls/find scoped to ."),
                     ChatMessage(role: "user", content: "cwd=\(pane.currentWorkingDirectory?.path ?? "")\nrequest=\(input)")
                 ]
             ).trimmingCharacters(in: .whitespacesAndNewlines)
