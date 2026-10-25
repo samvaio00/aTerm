@@ -562,13 +562,15 @@ private struct ModernPaneHeader: View {
             
             // Info section
             HStack(spacing: DesignSystem.Spacing.m) {
-                // Mode indicator
-                HStack(spacing: 4) {
-                    modeIcon
-                    Text(pane.modeIndicatorText)
-                        .font(DesignSystem.Typography.mono(10))
+                // Mode indicator (only when AI routing is active or a non-shell mode is shown)
+                if pane.aiRoutingMode == .smart || pane.modeIndicatorText != "TERMINAL" {
+                    HStack(spacing: 4) {
+                        modeIcon
+                        Text(pane.modeIndicatorText)
+                            .font(DesignSystem.Typography.mono(10))
+                    }
+                    .foregroundStyle(.secondary)
                 }
-                .foregroundStyle(.secondary)
                 
                 // AI routing mode toggle
                 Button {
