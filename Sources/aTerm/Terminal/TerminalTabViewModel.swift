@@ -309,6 +309,17 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         session.send(Data([0x15]))
     }
 
+    /// Write arbitrary text directly into the terminal buffer (natural terminal output).
+    func writeTerminalText(_ text: String) {
+        terminalBuffer.resetCurrentAttributesToDefault()
+        for ch in text {
+            if ch == "\r" { terminalBuffer.carriageReturn() }
+            else if ch == "\n" { terminalBuffer.lineFeed() }
+            else { terminalBuffer.putChar(ch) }
+        }
+        bufferVersion &+= 1
+    }
+
     /// Export scrollback + screen content as plain text
     func exportScrollbackText() -> String {
         terminalBuffer.plainText(includeScrollback: true)

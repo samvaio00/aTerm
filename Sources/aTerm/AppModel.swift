@@ -862,9 +862,20 @@ final class AppModel: ObservableObject {
             providers.append(updated)
 
             // Auto-select Ollama as the default provider when nothing is configured yet
-            if defaultProviderID == nil {
+            // or the current default requires credentials that are not stored.
+            let currentProvider = provider(for: defaultProviderID)
+            let currentNeedsCredential = (currentProvider?.authType ?? .none) != .none
+            let currentHasCredential = !((try? keychainStore.readSecret(account: defaultProviderID ?? "")) ?? "").isEmpty
+            if defaultProviderID == nil || (currentNeedsCredential && !currentHasCredential) {
                 defaultProviderID = "ollama"
                 defaultModelID = updated.models.first?.id
+                for tab in tabs {
+                    for pane in tab.panes {
+                        pane.appearance.aiProvider = "ollama"
+                        pane.appearance.aiModel = defaultModelID
+                    }
+                    refreshProviderLabel(for: tab)
+                }
             } else if defaultProviderID == "ollama" && defaultModelID == nil {
                 defaultModelID = updated.models.first?.id
             }
@@ -1117,19 +1128,19 @@ final class AppModel: ObservableObject {
     }
 
     private func answerQuery(_ input: String, for pane: TerminalPaneViewModel) async {
-        pane.queryResponse = QueryResponseState(text: "", isStreaming: true, suggestions: [])
+        pane.queryResponse = QueryResponseState()
 
         // Try local MCP answer first (quick offline fallback)
         if let mcpAnswer = mcpHost.localFilesystemAnswer(question: input, cwd: pane.currentWorkingDirectory) {
-            pane.queryResponse = QueryResponseState(text: mcpAnswer, isStreaming: false, suggestions: [])
             pane.conversationHistory.addUserMessage(input)
             pane.conversationHistory.addAssistantMessage(mcpAnswer)
+            pane.writeTerminalText("\nai> \(mcpAnswer)\n")
             return
         }
 
         guard let provider = provider(for: pane.appearance.aiProvider),
               let modelID = pane.appearance.aiModel else {
-            pane.queryResponse = QueryResponseState(text: "No provider or model configured for query mode.", isStreaming: false, suggestions: [])
+            pane.writeTerminalText("\nai> No provider or model configured for query mode.\n")
             return
         }
 
@@ -1153,19 +1164,17 @@ final class AppModel: ObservableObject {
             let userMsg = "Last output (tail): \(ctx.lastOutputSnippet)\n\nQuestion: \(input)"
             pane.conversationHistory.addUserMessage(userMsg)
 
-            pane.queryResponse = try await streamAIResponse(
+            pane.writeTerminalText("\nai> ")
+            _ = try await streamAIResponse(
                 provider: provider,
                 modelID: modelID,
                 conversationHistory: pane.conversationHistory,
-                initialResponse: pane.queryResponse,
-                pane: pane
+                initialResponse: QueryResponseState(),
+                pane: pane,
+                useCard: false
             )
         } catch {
-            pane.queryResponse = QueryResponseState(
-                text: "Query failed: \(error.localizedDescription)",
-                isStreaming: false,
-                suggestions: []
-            )
+            pane.writeTerminalText("Query failed: \(error.localizedDescription)\n")
         }
     }
 
@@ -1218,7 +1227,6 @@ final class AppModel: ObservableObject {
             if !trimmed.isEmpty {
                 pane.chatConversationHistory.addAssistantMessage(trimmed)
             }
-            pane.appendChatAssistantResponse(responseText)
             pane.queryResponse = QueryResponseState()
         } catch {
             let errorText = "Chat query failed: \(error.localizedDescription)"
@@ -1240,20 +1248,12 @@ final class AppModel: ObservableObject {
             modelID: modelID,
             messages: conversationHistory.simplifiedMessages
         )
+        pane.writeTerminalText("ai> ")
         for try await chunk in stream {
             accumulated.append(chunk)
-            let text = accumulated
-            await MainActor.run {
-                pane.queryResponse = QueryResponseState(text: text, isStreaming: true, suggestions: [])
-            }
+            pane.writeTerminalText(chunk)
         }
-        await MainActor.run {
-            pane.queryResponse = QueryResponseState(
-                text: accumulated,
-                isStreaming: false,
-                suggestions: extractSuggestions(from: accumulated)
-            )
-        }
+        pane.writeTerminalText("\n")
         return accumulated
     }
 
@@ -1276,18 +1276,24 @@ final class AppModel: ObservableObject {
         modelID: String,
         conversationHistory: ConversationHistory,
         initialResponse: QueryResponseState,
-        pane: TerminalPaneViewModel
+        pane: TerminalPaneViewModel,
+        useCard: Bool = true
     ) async throws -> QueryResponseState {
         var queryResponse = initialResponse
-        queryResponse.isStreaming = true
-        pane.queryResponse = queryResponse
+        var fullText = ""
+        if useCard {
+            queryResponse.isStreaming = true
+            pane.queryResponse = queryResponse
+        }
 
         let toolSchemas = mcpHost.toolSchemas()
         let maxToolRoundTrips = 5
 
         func publishProgress() {
-            queryResponse.isStreaming = true
-            pane.queryResponse = queryResponse
+            if useCard {
+                queryResponse.isStreaming = true
+                pane.queryResponse = queryResponse
+            }
         }
 
         // Tool call loop: stream response, execute any tool calls, feed results back
@@ -1304,7 +1310,12 @@ final class AppModel: ObservableObject {
                 )
                 for try await chunk in stream {
                     responseText.append(chunk)
-                    queryResponse.text.append(chunk)
+                    if useCard {
+                        queryResponse.text.append(chunk)
+                    } else {
+                        fullText.append(chunk)
+                        pane.writeTerminalText(chunk)
+                    }
                     publishProgress()
                 }
             } else {
@@ -1319,7 +1330,12 @@ final class AppModel: ObservableObject {
                     switch event {
                     case .text(let chunk):
                         responseText.append(chunk)
-                        queryResponse.text.append(chunk)
+                        if useCard {
+                            queryResponse.text.append(chunk)
+                        } else {
+                            fullText.append(chunk)
+                            pane.writeTerminalText(chunk)
+                        }
                         publishProgress()
                     case .toolCall(let request):
                         toolCalls.append(request)
@@ -1339,12 +1355,22 @@ final class AppModel: ObservableObject {
                 do {
                     let result = try await mcpHost.callTool(name: call.name, arguments: call.arguments)
                     toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: result))
-                    queryResponse.text.append("\n\n*[Used tool: \(call.name)]*\n")
+                    let note = "\n\n*[Used tool: \(call.name)]*\n"
+                    if useCard {
+                        queryResponse.text.append(note)
+                    } else {
+                        pane.writeTerminalText(note)
+                    }
                     publishProgress()
                 } catch {
                     let errorMsg = "Tool '\(call.name)' failed: \(error.localizedDescription)"
                     toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: errorMsg))
-                    queryResponse.text.append("\n\n*[\(errorMsg)]*\n")
+                    let note = "\n\n*[\(errorMsg)]*\n"
+                    if useCard {
+                        queryResponse.text.append(note)
+                    } else {
+                        pane.writeTerminalText(note)
+                    }
                     publishProgress()
                 }
             }
@@ -1359,10 +1385,19 @@ final class AppModel: ObservableObject {
             // prompting the model to generate a final answer
         }
 
-        queryResponse.isStreaming = false
-        queryResponse.suggestions = extractSuggestions(from: queryResponse.text)
-        pane.queryResponse = queryResponse
-        return queryResponse
+        if useCard {
+            queryResponse.isStreaming = false
+            queryResponse.suggestions = extractSuggestions(from: queryResponse.text)
+            pane.queryResponse = queryResponse
+            return queryResponse
+        } else {
+            pane.writeTerminalText("\n")
+            if !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                conversationHistory.addAssistantMessage(fullText)
+            }
+            pane.queryResponse = QueryResponseState()
+            return QueryResponseState()
+        }
     }
     
     /// Streams AI response directly to pane (updates UI in real-time)
