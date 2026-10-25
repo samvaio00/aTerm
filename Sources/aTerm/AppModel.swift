@@ -582,11 +582,9 @@ final class AppModel: ObservableObject {
             // Auto-run the generated command unless it looks dangerous, in which case
             // keep the confirmation card so the user can review/edit.
             let generated = pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-            let isBroad = generated.contains("cd ") || generated.contains(" /") || generated.contains(" ~") || generated.contains("~")
             if !generated.isEmpty,
                !generated.hasPrefix("Generation failed"),
-               !inputClassifier.isDangerousCommand(generated),
-               !isBroad {
+               !inputClassifier.isDangerousCommand(generated) {
                 pane.aiShellState = AIShellState()
                 pane.sendTerminalCommand(generated)
             }
