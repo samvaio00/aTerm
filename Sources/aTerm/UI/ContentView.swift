@@ -486,36 +486,39 @@ private struct ModernTerminalPane: View {
             .background(Color(appModel.theme(for: pane.appearance.themeID).palette.background.nsColor))
             .padding(.vertical, 4)
             
-            // Search bar
-            if pane.isSearchPresented {
-                ModernSearchBar(pane: pane)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-            
+            // Search bar (overlay so terminal keeps full height)
             // Agent exit banner
             if let banner = pane.agentExitBanner {
                 ModernAgentExitBanner(pane: pane, text: banner)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            
-            // AI cards stack (floating overlay)
+        }
+        .overlay(alignment: .bottom) {
             VStack(spacing: 0) {
-                if case let .waitingForDisambiguation(input) = pane.submissionState {
-                    ModernDisambiguationBar(input: input, pane: pane)
+                if pane.isSearchPresented {
+                    ModernSearchBar(pane: pane)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
-                
-                if !pane.aiShellState.generatedCommand.isEmpty || pane.aiShellState.isGenerating {
-                    ModernAIShellCard(pane: pane)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+
+                // AI cards stack (floating overlay)
+                VStack(spacing: 0) {
+                    if case let .waitingForDisambiguation(input) = pane.submissionState {
+                        ModernDisambiguationBar(input: input, pane: pane)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+
+                    if !pane.aiShellState.generatedCommand.isEmpty || pane.aiShellState.isGenerating {
+                        ModernAIShellCard(pane: pane)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+
+                    if !pane.isChatModeActive && (!pane.queryResponse.text.isEmpty || pane.queryResponse.isStreaming) {
+                        ModernQueryResponseCard(pane: pane)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
-                
-                if !pane.isChatModeActive && (!pane.queryResponse.text.isEmpty || pane.queryResponse.isStreaming) {
-                    ModernQueryResponseCard(pane: pane)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
+                .padding(.bottom, pane.isAlternateScreen ? 0 : DesignSystem.Spacing.m)
             }
-            .padding(.bottom, pane.isAlternateScreen ? 0 : DesignSystem.Spacing.m)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(DesignSystem.Colors.terminalBackground)
