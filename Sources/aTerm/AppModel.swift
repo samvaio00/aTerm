@@ -467,7 +467,9 @@ final class AppModel: ObservableObject {
         if lineAlreadyBufferedInShell {
             let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
             let isExplicitSmartLine = trimmed.first.map { ["!", ">", "$"].contains($0) } ?? false
-            let shouldClassify = isExplicitSmartLine || pane.aiRoutingMode == .smart
+            let shellScore = ShellSyntaxAnalyzer.analyze(trimmed).shellScore
+            let isLikelyShell = shellScore > 0.5
+            let shouldClassify = isExplicitSmartLine || (pane.aiRoutingMode == .smart && !isLikelyShell)
             if !shouldClassify {
                 pane.clearAssistantState()
                 pane.sendBufferedReturnToShell()
@@ -855,17 +857,20 @@ final class AppModel: ObservableObject {
                 updated.models.append(model)
             }
 
-            // Update provider if new models found
-            if updated.models.count != ollamaProvider.models.count {
-                providers.removeAll(where: { $0.id == "ollama" })
-                providers.append(updated)
-                // Auto-select first Ollama model if none chosen yet
-                if defaultProviderID == "ollama" && defaultModelID == nil {
-                    defaultModelID = updated.models.first?.id
-                }
-                persistProviders()
-                tabs.forEach(refreshProviderLabel(for:))
+            // Merge detected models into the provider list
+            providers.removeAll(where: { $0.id == "ollama" })
+            providers.append(updated)
+
+            // Auto-select Ollama as the default provider when nothing is configured yet
+            if defaultProviderID == nil {
+                defaultProviderID = "ollama"
+                defaultModelID = updated.models.first?.id
+            } else if defaultProviderID == "ollama" && defaultModelID == nil {
+                defaultModelID = updated.models.first?.id
             }
+            persistProviders()
+            tabs.forEach(applyDefaultProviderIfNeeded(to:))
+            tabs.forEach(refreshProviderLabel(for:))
         } catch {
             // Ollama not running — that's fine, skip silently
         }
