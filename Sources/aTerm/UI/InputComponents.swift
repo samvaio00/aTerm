@@ -1,69 +1,6 @@
 import AppKit
 import SwiftUI
 
-// MARK: - Modern Smart Input Bar
-
-struct ModernSmartInputBar: View {
-    @EnvironmentObject private var windowModel: WindowModel
-    @ObservedObject var pane: TerminalPaneViewModel
-    @State private var isFocused = false
-    
-    var body: some View {
-        HStack(spacing: DesignSystem.Spacing.m) {
-            // Mode indicator with icon
-            ModeIndicator(mode: pane.modeIndicatorText)
-            
-            // Input field
-            ModernTextField(
-                placeholder: "Enter command, natural language, or question...",
-                text: $pane.inputText,
-                onSubmit: { windowModel.submitInput(for: pane) }
-            )
-            
-            // Send button
-            Button(action: { windowModel.submitInput(for: pane) }) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 18))
-                    .foregroundColor(pane.inputText.isEmpty ? .secondary : .accentColor)
-            }
-            .buttonStyle(.plain)
-            .disabled(pane.inputText.isEmpty)
-            .keyboardShortcut(.return, modifiers: [])
-        }
-        .padding(.horizontal, DesignSystem.Spacing.m)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 0)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 0)
-                        .strokeBorder(isFocused ? Color.accentColor.opacity(0.3) : Color.clear, lineWidth: 1)
-                )
-        )
-        .onAppear {
-            // Track focus state
-            NotificationCenter.default.addObserver(
-                forName: NSControl.textDidBeginEditingNotification,
-                object: nil,
-                queue: .main
-            ) { [self] _ in
-                MainActor.assumeIsolated {
-                    isFocused = true
-                }
-            }
-            NotificationCenter.default.addObserver(
-                forName: NSControl.textDidEndEditingNotification,
-                object: nil,
-                queue: .main
-            ) { [self] _ in
-                MainActor.assumeIsolated {
-                    isFocused = false
-                }
-            }
-        }
-    }
-}
-
 // MARK: - Mode Indicator
 
 private struct ModeIndicator: View {
