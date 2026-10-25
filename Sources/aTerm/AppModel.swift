@@ -579,6 +579,16 @@ final class AppModel: ObservableObject {
             pane.modeIndicatorText = "\(InputMode.aiToShell.rawValue) (\(result.confidence.description))"
             await generateShellCommand(from: input, for: pane)
 
+            // Auto-run the generated command unless it looks dangerous, in which case
+            // keep the confirmation card so the user can review/edit.
+            let generated = pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !generated.isEmpty,
+               !generated.hasPrefix("Generation failed"),
+               !inputClassifier.isDangerousCommand(generated) {
+                pane.aiShellState = AIShellState()
+                pane.sendTerminalCommand(generated)
+            }
+
         case .query:
             if lineAlreadyBufferedInShell {
                 pane.sendShellKillLineToPTY()
