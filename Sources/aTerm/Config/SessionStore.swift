@@ -8,6 +8,18 @@ struct SessionStore {
         let workingDirectoryPath: String?
         let profileID: UUID?
         let agentDefinitionID: String?
+        let conversationMessages: [StoredConversationMessage]?
+        let chatConversationMessages: [StoredConversationMessage]?
+
+        init(id: UUID, title: String, workingDirectoryPath: String? = nil, profileID: UUID? = nil, agentDefinitionID: String? = nil, conversationMessages: [StoredConversationMessage]? = nil, chatConversationMessages: [StoredConversationMessage]? = nil) {
+            self.id = id
+            self.title = title
+            self.workingDirectoryPath = workingDirectoryPath
+            self.profileID = profileID
+            self.agentDefinitionID = agentDefinitionID
+            self.conversationMessages = conversationMessages
+            self.chatConversationMessages = chatConversationMessages
+        }
 
         var workingDirectoryURL: URL? {
             guard let workingDirectoryPath else { return nil }

@@ -205,13 +205,13 @@ final class InputClassifier {
     /// Checks if input should force chat/query mode
     func isChatCommand(_ input: String) -> Bool {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.lowercased().hasPrefix("/chat") && !trimmed.lowercased().hasPrefix("/chat-exit")
+        return trimmed.lowercased().hasPrefix("/chat") && !trimmed.lowercased().hasPrefix("/chat-exit") && !trimmed.lowercased().hasPrefix("/chatexit")
     }
     
     /// Checks if input is chat exit command
     func isChatExitCommand(_ input: String) -> Bool {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.lowercased() == "/chat-exit"
+        return trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chatexit"
     }
     
     /// Returns true if input is dangerous (destructive command)

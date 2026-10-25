@@ -6,6 +6,7 @@ struct TermConfig {
     var aiModel: String?
     var classifierModel: String?
     var mcpServers: [String] = []
+    var mcpAutoStart: Bool = true
     var defaultAgent: String?
     var agentAutoStart: Bool = false
 
@@ -50,6 +51,8 @@ struct TermConfig {
                     .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
                     .split(separator: ",")
                     .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \"")) }
+            case ("mcp", "auto_start"):
+                config.mcpAutoStart = value.lowercased() == "true"
             case ("agents", "default"):
                 config.defaultAgent = value
             case ("agents", "auto_start"):

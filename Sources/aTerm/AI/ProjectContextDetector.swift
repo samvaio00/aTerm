@@ -182,6 +182,41 @@ final class ProjectContextDetector {
         return fileManager.fileExists(atPath: gitDir.path)
     }
     
+    /// Builds a compact project memory snippet (README head + recent git log) for AI context.
+    func projectMemorySnippet(for directory: URL?) -> String? {
+        guard let directory else { return nil }
+        var parts: [String] = []
+
+        // README head
+        let readmeURL = directory.appendingPathComponent("README.md")
+        if let text = try? String(contentsOf: readmeURL, encoding: .utf8) {
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true).prefix(12)
+            if !lines.isEmpty {
+                parts.append("README:\n" + lines.joined(separator: "\n"))
+            }
+        }
+
+        // Recent git log
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        task.arguments = ["-C", directory.path, "log", "--oneline", "-5"]
+        task.environment = ["LANG": "en_US.UTF-8"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let log = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !log.isEmpty {
+                parts.append("Recent commits:\n" + log)
+            }
+        } catch {}
+
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: "\n\n")
+    }
+
     /// Clears the cache (call when project structure might have changed)
     func invalidateCache(for directory: URL?) {
         guard let directory = directory else {

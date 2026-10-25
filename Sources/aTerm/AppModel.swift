@@ -73,7 +73,7 @@ final class AppModel: ObservableObject {
         Task {
             // Yield so the main window and Settings (if opened) can lay out before network + provider writes.
             try? await Task.sleep(nanoseconds: 400_000_000)
-            await detectOllamaModels()
+            await refreshOllamaModels()
         }
         Log.debug("app", "AppModel.init() done, onboarding=\(isOnboardingPresented)")
     }
@@ -84,8 +84,8 @@ final class AppModel: ObservableObject {
     }
 
     var allThemes: [TerminalTheme] {
-        // Single theme only - modern bright theme
-        BuiltinThemes.all
+        // Built-ins plus any themes imported by the user.
+        importedThemes + BuiltinThemes.all
     }
 
     var availableProviders: [ModelProvider] {
@@ -199,6 +199,33 @@ final class AppModel: ObservableObject {
 
     func restartAgentPane(_ pane: TerminalPaneViewModel) {
         pane.restartSessionIfPossible()
+    }
+
+    /// Asks the AI to explain the most recent failed command and suggest a fix.
+    func explainLastFailure(for pane: TerminalPaneViewModel?) {
+        guard let pane else { return }
+        let ctx = pane.terminalContext()
+        var prompt = "Explain why the last command failed and suggest a concrete fix or corrected command."
+        if let last = ctx.lastCommands.last { prompt += "\nLast command: \(last)" }
+        if let code = ctx.lastExitCode { prompt += "\nExit code: \(code)" }
+        if !ctx.recentFailures.isEmpty { prompt += "\nRecent failures: \(ctx.recentFailures.joined(separator: ", "))" }
+        if !ctx.lastOutputSnippet.isEmpty { prompt += "\nTerminal output (tail): \(ctx.lastOutputSnippet)" }
+        Task { @MainActor in
+            await answerQuery(prompt, for: pane)
+        }
+    }
+
+    /// Generates a corrected version of the most recent failed command.
+    func fixLastCommand(for pane: TerminalPaneViewModel?) {
+        guard let pane else { return }
+        let ctx = pane.terminalContext()
+        guard let last = ctx.lastCommands.last else { return }
+        var request = "Fix the failed command: \(last)"
+        if let code = ctx.lastExitCode { request += " (exit code \(code))" }
+        if !ctx.lastOutputSnippet.isEmpty { request += ". Terminal output: \(ctx.lastOutputSnippet)" }
+        Task { @MainActor in
+            await generateShellCommand(from: request, for: pane)
+        }
     }
 
     func splitSelectedPane(_ orientation: PaneSplitOrientation) {
@@ -440,7 +467,8 @@ final class AppModel: ObservableObject {
         if lineAlreadyBufferedInShell {
             let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
             let isExplicitSmartLine = trimmed.first.map { ["!", ">", "$"].contains($0) } ?? false
-            if !isExplicitSmartLine {
+            let shouldClassify = isExplicitSmartLine || pane.aiRoutingMode == .smart
+            if !shouldClassify {
                 pane.clearAssistantState()
                 pane.sendBufferedReturnToShell()
                 return
@@ -792,7 +820,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func detectOllamaModels() async {
+    func refreshOllamaModels() async {
         guard let ollamaProvider = providers.first(where: { $0.id == "ollama" }) else { return }
 
         // Probe Ollama API for running models
@@ -969,7 +997,9 @@ final class AppModel: ObservableObject {
                             title: $0.title,
                             workingDirectoryPath: $0.currentWorkingDirectory?.path,
                             profileID: $0.profileID,
-                            agentDefinitionID: agentDefinitionID
+                            agentDefinitionID: agentDefinitionID,
+                            conversationMessages: $0.conversationHistory.persistableMessages,
+                            chatConversationMessages: $0.chatConversationHistory.persistableMessages
                         )
                     }
                 )
@@ -999,6 +1029,12 @@ final class AppModel: ObservableObject {
                 launchConfiguration: configuration
             )
             applyDefaultProviderIfNeeded(to: pane)
+            if let messages = descriptor.conversationMessages {
+                for m in messages { pane.conversationHistory.addMessage(role: m.role, text: m.text) }
+            }
+            if let messages = descriptor.chatConversationMessages {
+                for m in messages { pane.chatConversationHistory.addMessage(role: m.role, text: m.text) }
+            }
             return pane
         }
 
@@ -1009,6 +1045,12 @@ final class AppModel: ObservableObject {
             profile: profile
         )
         applyDefaultProviderIfNeeded(to: pane)
+        if let messages = descriptor.conversationMessages {
+            for m in messages { pane.conversationHistory.addMessage(role: m.role, text: m.text) }
+        }
+        if let messages = descriptor.chatConversationMessages {
+            for m in messages { pane.chatConversationHistory.addMessage(role: m.role, text: m.text) }
+        }
         return pane
     }
 
@@ -1088,15 +1130,22 @@ final class AppModel: ObservableObject {
 
         do {
             // Build system message with context
+            let ctx = pane.terminalContext()
+            let projectMemory = ProjectContextDetector.shared.projectMemorySnippet(for: pane.currentWorkingDirectory)
             let systemPrompt = """
             You answer terminal questions concisely. If a shell command would help, include it in a fenced ```bash block.
             Current directory: \(pane.currentWorkingDirectory?.path ?? "unknown")
-            Recent commands: \(pane.terminalContext().lastCommands.joined(separator: " | "))
+            Git branch: \(ctx.gitBranch ?? "unknown")
+            Project type: \(ctx.projectType.rawValue)
+            Recent commands: \(ctx.lastCommands.joined(separator: " | "))
+            Recent failures: \(ctx.recentFailures.joined(separator: " | "))
+            Last exit code: \(ctx.lastExitCode.map(String.init) ?? "n/a")
+            \(projectMemory.map { "\nProject memory:\n\($0)" } ?? "")
             You have access to MCP tools. Use them when the user's question requires real data from their filesystem, git, or other connected services.
             """
 
             pane.conversationHistory.addSystemMessage(systemPrompt)
-            let userMsg = "Last output: \(pane.terminalContext().lastOutputSnippet)\n\nQuestion: \(input)"
+            let userMsg = "Last output (tail): \(ctx.lastOutputSnippet)\n\nQuestion: \(input)"
             pane.conversationHistory.addUserMessage(userMsg)
 
             pane.queryResponse = try await streamAIResponse(
@@ -1143,6 +1192,7 @@ final class AppModel: ObservableObject {
             Prefer concise answers. Use markdown: short paragraphs, ```bash or ```python for commands/code. Keep prose lines reasonably short so they read well in a fixed-width terminal.
 
             Current directory: \(pane.currentWorkingDirectory?.path ?? "unknown")
+            \(ProjectContextDetector.shared.projectMemorySnippet(for: pane.currentWorkingDirectory).map { "\nProject memory:\n\($0)" } ?? "")
             """
 
             // Initialize history if needed
@@ -1503,12 +1553,18 @@ final class AppModel: ObservableObject {
             tab.appearance = appearance
         }
 
-        if !config.mcpServers.isEmpty {
+        if config.mcpAutoStart && !config.mcpServers.isEmpty {
             for serverID in config.mcpServers {
                 if let definition = mcpServers.first(where: { $0.id == serverID }) {
                     startMCPServer(definition, cwd: directory)
                 }
             }
+        }
+
+        if config.agentAutoStart, let defaultAgentID = config.defaultAgent,
+           let definition = agentDefinitions.first(where: { $0.id == defaultAgentID }),
+           agentStatuses[definition.id]?.isInstalled == true {
+            launchAgent(definition, from: tab)
         }
 
         refreshProviderLabel(for: tab)
@@ -1551,7 +1607,9 @@ final class AppModel: ObservableObject {
                             title: $0.title,
                             workingDirectoryPath: $0.currentWorkingDirectory?.path,
                             profileID: $0.profileID,
-                            agentDefinitionID: agentDefinitionID
+                            agentDefinitionID: agentDefinitionID,
+                            conversationMessages: $0.conversationHistory.persistableMessages,
+                            chatConversationMessages: $0.chatConversationHistory.persistableMessages
                         )
                     }
                 )

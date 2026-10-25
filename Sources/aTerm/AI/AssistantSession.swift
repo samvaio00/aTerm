@@ -118,6 +118,11 @@ struct RichMessage {
     }
 }
 
+struct StoredConversationMessage: Codable {
+    let role: String
+    let text: String
+}
+
 /// Maintains conversation history for multi-turn AI queries per pane
 @MainActor
 final class ConversationHistory {
@@ -163,6 +168,22 @@ final class ConversationHistory {
 
     func clear() {
         messages.removeAll()
+    }
+
+    /// Generic message insertion used for restoring persisted history.
+    func addMessage(role: String, text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        switch role {
+        case "system": addSystemMessage(text)
+        case "assistant": addAssistantMessage(text)
+        default: addUserMessage(text)
+        }
+    }
+
+    /// Export a simplified, persistable snapshot of the conversation.
+    var persistableMessages: [StoredConversationMessage] {
+        messages.map { StoredConversationMessage(role: $0.role, text: $0.text) }
     }
 
     private func trimIfNeeded() {

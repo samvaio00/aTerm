@@ -8,6 +8,7 @@ final class MCPHost {
         var stdinPipe: Pipe?
         var stdoutPipe: Pipe?
         var stderrPipe: Pipe?
+        var messageEndpoint: URL?
         var logs: [String] = []
         var tools: [MCPToolDescriptor] = []
         var status: MCPServerStatus = .stopped
@@ -123,9 +124,20 @@ final class MCPHost {
             }
 
         case .sse:
-            runtime.status = URL(string: definition.endpoint ?? "") == nil ? .error : .running
-            runtime.lastError = runtime.status == .error ? "Invalid SSE endpoint" : nil
+            guard let endpointString = definition.endpoint, let url = URL(string: endpointString) else {
+                runtime.status = .error
+                runtime.lastError = "Invalid SSE endpoint"
+                runtimes[definition.id] = runtime
+                return
+            }
+            runtime.status = .running
+            runtime.lastError = nil
             runtimes[definition.id] = runtime
+            let serverID = definition.id
+            let task = Task { @MainActor in
+                await self.runSSEConnection(serverID: serverID, endpoint: url)
+            }
+            runtimes[definition.id]?.readTask = task
         }
     }
 
@@ -146,6 +158,7 @@ final class MCPHost {
         runtime.stdoutPipe = nil
         runtime.stderrPipe = nil
         runtime.retryCount = 0
+        runtime.messageEndpoint = nil
         runtimes[serverID] = runtime
     }
 
@@ -260,7 +273,7 @@ final class MCPHost {
     }
 
     private func sendRequest(serverID: String, method: String, params: [String: Any]) async throws -> JSONRPCResponse {
-        guard var runtime = runtimes[serverID], let stdinPipe = runtime.stdinPipe else {
+        guard var runtime = runtimes[serverID] else {
             throw MCPError.serverNotRunning
         }
 
@@ -276,6 +289,33 @@ final class MCPHost {
         ]
 
         let data = try JSONSerialization.data(withJSONObject: message)
+
+        // SSE transport: POST to the message endpoint; response arrives over the SSE stream.
+        if let messageEndpoint = runtime.messageEndpoint {
+            return try await withCheckedThrowingContinuation { continuation in
+                runtimes[serverID]?.pendingResponses[requestID] = continuation
+
+                Task {
+                    var request = URLRequest(url: messageEndpoint)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = data
+                    _ = try? await URLSession.shared.data(for: request)
+                }
+
+                Task {
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    if let cont = self.runtimes[serverID]?.pendingResponses.removeValue(forKey: requestID) {
+                        cont.resume(throwing: MCPError.timeout)
+                    }
+                }
+            }
+        }
+
+        guard let stdinPipe = runtimes[serverID]?.stdinPipe else {
+            throw MCPError.serverNotRunning
+        }
+
         var payload = data
         payload.append(contentsOf: "\n".utf8)
 
@@ -299,8 +339,6 @@ final class MCPHost {
     }
 
     private func sendNotification(serverID: String, method: String, params: [String: Any]?) {
-        guard let stdinPipe = runtimes[serverID]?.stdinPipe else { return }
-
         var message: [String: Any] = [
             "jsonrpc": "2.0",
             "method": method,
@@ -308,12 +346,87 @@ final class MCPHost {
         if let params { message["params"] = params }
 
         guard let data = try? JSONSerialization.data(withJSONObject: message) else { return }
+
+        if let messageEndpoint = runtimes[serverID]?.messageEndpoint {
+            var request = URLRequest(url: messageEndpoint)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = data
+            Task { _ = try? await URLSession.shared.data(for: request) }
+            return
+        }
+
+        guard let stdinPipe = runtimes[serverID]?.stdinPipe else { return }
         var payload = data
         payload.append(contentsOf: "\n".utf8)
         let payloadToSend = payload
         let pipe = stdinPipe
         DispatchQueue.global(qos: .userInitiated).async {
             pipe.fileHandleForWriting.write(payloadToSend)
+        }
+    }
+
+    private func runSSEConnection(serverID: String, endpoint: URL) async {
+        var retries = 0
+        while retries <= Self.maxRetries, !Task.isCancelled {
+            do {
+                var request = URLRequest(url: endpoint)
+                request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                request.timeoutInterval = 60
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                    throw MCPError.serverError("SSE connection failed")
+                }
+
+                runtimes[serverID]?.status = .running
+                runtimes[serverID]?.lastError = nil
+
+                var eventName = ""
+                var dataBuffer = ""
+
+                for try await line in bytes.lines {
+                    if Task.isCancelled { break }
+                    if line.isEmpty {
+                        // Dispatch event
+                        let trimmedEvent = eventName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let payload = dataBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if trimmedEvent == "endpoint", !payload.isEmpty {
+                            if let url = URL(string: payload, relativeTo: endpoint) {
+                                runtimes[serverID]?.messageEndpoint = url
+                                // Initialize once endpoint is known
+                                Task { @MainActor in
+                                    await self.initializeServer(serverID: serverID)
+                                }
+                            }
+                        } else if !payload.isEmpty {
+                            handleServerMessage(Data(payload.utf8), serverID: serverID)
+                        }
+                        eventName = ""
+                        dataBuffer = ""
+                    } else if line.hasPrefix("event:") {
+                        eventName = String(line.dropFirst(6))
+                    } else if line.hasPrefix("data:") {
+                        let chunk = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        if !dataBuffer.isEmpty { dataBuffer += "\n" }
+                        dataBuffer += chunk
+                    }
+                }
+
+                // Stream ended normally
+                break
+            } catch {
+                retries += 1
+                runtimes[serverID]?.status = .error
+                runtimes[serverID]?.lastError = error.localizedDescription
+                appendLog("SSE connection error: \(error.localizedDescription)", serverID: serverID)
+                if retries <= Self.maxRetries {
+                    appendLog("Reconnecting in 2s (attempt \(retries)/\(Self.maxRetries))...", serverID: serverID)
+                    try? await Task.sleep(nanoseconds: Self.retryDelayNS)
+                }
+            }
+        }
+        if retries > Self.maxRetries {
+            appendLog("SSE server gave up after \(Self.maxRetries) retries.", serverID: serverID)
         }
     }
 

@@ -12,6 +12,11 @@ enum PaneSplitOrientation: String, Codable {
     case vertical
 }
 
+enum AIRoutingMode: String, CaseIterable, Codable {
+    case shell
+    case smart
+}
+
 struct ScrollbackSearchMatch: Equatable {
     let location: Int
     let length: Int
@@ -35,6 +40,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     @Published var aiShellState = AIShellState()
     @Published var submissionState: InputSubmissionState = .idle
     @Published var modeIndicatorText: String = "TERMINAL"
+    @Published var aiRoutingMode: AIRoutingMode = .shell
     @Published var agentExitBanner: String?
     @Published var isAgentAutoRestartEnabled = false
     @Published var isSearchPresented = false
@@ -114,7 +120,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     func duplicateForSplit(id: UUID = UUID()) -> TerminalPaneViewModel {
-        TerminalPaneViewModel(
+        let clone = TerminalPaneViewModel(
             id: id,
             initialTitle: title,
             workingDirectory: currentWorkingDirectory ?? preferredWorkingDirectory,
@@ -122,6 +128,8 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             kind: kind,
             launchConfiguration: explicitLaunchConfiguration
         )
+        clone.aiRoutingMode = aiRoutingMode
+        return clone
     }
 
     func startIfNeeded() {
@@ -164,7 +172,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
                     let message = chatInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
                     appendChatLine("")
                     chatInputBuffer = ""
-                    if message.lowercased() == "/chat-exit" || message.lowercased() == "/chat-eixt" {
+                    if message.lowercased() == "/chat-exit" || message.lowercased() == "/chatexit" || message.lowercased() == "/chat-eixt" {
                         exitChatMode()
                         return
                     }
@@ -196,7 +204,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             }
 
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chat-eixt" {
+            if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chatexit" || trimmed.lowercased() == "/chat-eixt" {
                 exitChatMode()
                 return
             }

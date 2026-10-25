@@ -43,11 +43,13 @@ struct TermConfigTests {
         let content = """
         [mcp]
         servers = ["filesystem", "git"]
+        auto_start = true
         """
         
         let config = TermConfig.parse(content)
         
         #expect(config.mcpServers == ["filesystem", "git"])
+        #expect(config.mcpAutoStart == true)
     }
     
     @Test

@@ -567,6 +567,21 @@ private struct ModernPaneHeader: View {
                 }
                 .foregroundStyle(.secondary)
                 
+                // AI routing mode toggle
+                Button {
+                    pane.aiRoutingMode = (pane.aiRoutingMode == .shell ? .smart : .shell)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: pane.aiRoutingMode == .shell ? "dollarsign.circle" : "sparkles")
+                            .font(.system(size: 9))
+                        Text(pane.aiRoutingMode == .shell ? "Shell" : "Smart")
+                            .font(DesignSystem.Typography.defaultFont(10, weight: .medium))
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(pane.aiRoutingMode == .shell ? Color.secondary : Color.accentColor)
+                .help("Toggle AI routing for unprefixed input")
+
                 // Provider info
                 HStack(spacing: 4) {
                     Image(systemName: "cpu")

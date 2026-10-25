@@ -644,7 +644,7 @@ final class TerminalGridView: NSView {
             if event.keyCode == 36 {
                 // Check if local buffer starts with /chat command
                 let trimmed = localLineBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chat-eixt" {
+                if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chatexit" || trimmed.lowercased() == "/chat-eixt" {
                     localLineBuffer = ""
                     inputHandler?.sendChatExit()
                     return

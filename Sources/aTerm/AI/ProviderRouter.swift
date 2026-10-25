@@ -31,13 +31,45 @@ struct ProviderRouter {
     private let keychainStore = KeychainStore()
     var oauthManager: OAuthManager?
 
+    /// Fetches streaming bytes with a small retry/backoff for transient network errors.
+    private func bytesWithRetry(for request: URLRequest, maxAttempts: Int = 3) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        var lastError: Error?
+        for attempt in 0..<maxAttempts {
+            if Task.isCancelled { throw CancellationError() }
+            do {
+                return try await URLSession.shared.bytes(for: request)
+            } catch {
+                lastError = error
+                if attempt < maxAttempts - 1 {
+                    let delay = UInt64(pow(2.0, Double(attempt))) * 500_000_000
+                    try? await Task.sleep(nanoseconds: delay)
+                }
+            }
+        }
+        throw lastError ?? URLError(.unknown)
+    }
+
     func testConnection(provider: ModelProvider) async throws -> ProviderTestResult {
         let modelID = provider.models.first?.id ?? defaultModelID(for: provider)
         let body = try makeRequestBody(provider: provider, modelID: modelID, messages: [ChatMessage(role: "user", content: "Respond with the single word pong.")], stream: false)
         let request = try await buildRequestAsync(provider: provider, body: body)
 
         let start = Date()
-        let (data, _) = try await URLSession.shared.data(for: request)
+        var data: Data = Data()
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                (data, _) = try await URLSession.shared.data(for: request)
+                lastError = nil
+                break
+            } catch {
+                lastError = error
+                if attempt < 2 {
+                    try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt))) * 500_000_000)
+                }
+            }
+        }
+        if let lastError { throw lastError }
         let latencyMS = Int(Date().timeIntervalSince(start) * 1000)
         let message = try parseResponseMessage(data: data, provider: provider)
         return ProviderTestResult(latencyMS: latencyMS, message: message)
@@ -51,7 +83,7 @@ struct ProviderRouter {
             let task = Task {
                 do {
                     let request = try await self.buildRequestAsync(provider: provider, body: body)
-                    let (bytes, _) = try await URLSession.shared.bytes(for: request)
+                    let (bytes, _) = try await self.bytesWithRetry(for: request)
 
                     for try await line in bytes.lines {
                         if Task.isCancelled {
@@ -111,7 +143,7 @@ struct ProviderRouter {
             let task = Task {
                 do {
                     let request = try await self.buildRequestAsync(provider: provider, body: body)
-                    let (bytes, _) = try await URLSession.shared.bytes(for: request)
+                    let (bytes, _) = try await self.bytesWithRetry(for: request)
 
                     // Accumulators for in-progress tool calls
                     var pendingToolCalls: [Int: (id: String, name: String, argsJSON: String)] = [:]
@@ -241,7 +273,21 @@ struct ProviderRouter {
     func complete(provider: ModelProvider, modelID: String, messages: [ChatMessage]) async throws -> String {
         let body = try makeRequestBody(provider: provider, modelID: modelID, messages: messages, stream: false)
         let request = try await buildRequestAsync(provider: provider, body: body)
-        let (data, _) = try await URLSession.shared.data(for: request)
+        var data: Data = Data()
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                (data, _) = try await URLSession.shared.data(for: request)
+                lastError = nil
+                break
+            } catch {
+                lastError = error
+                if attempt < 2 {
+                    try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt))) * 500_000_000)
+                }
+            }
+        }
+        if let lastError { throw lastError }
         return try parseResponseMessage(data: data, provider: provider)
     }
 

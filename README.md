@@ -230,7 +230,7 @@ bash install.sh
 
 1. **Launch aTerm.** A new `zsh` session opens automatically.
 2. **Run a shell command** — type `ls -la` at the prompt and press **Return**. It runs in the shell as normal.
-3. **Generate a command from plain English** — type `list all running docker containers` and press **Return**. aTerm generates the shell command and shows it in a card to review, edit, and run — or press **Escape** to dismiss.
+3. **Generate a command from plain English** — toggle the pane to **Smart** mode (or prefix with `>`), then type `list all running docker containers` and press **Return**. aTerm generates the shell command and shows it in a card to review, edit, and run — or press **Escape** to dismiss. In default **Shell** mode, input runs directly in zsh.
 4. **Enter chat mode** — type `/chat` at the prompt and press **Return**. You're now in a direct AI conversation, completely separate from the shell. Ask anything, paste code, ask follow-up questions. Nothing runs in the shell.
 5. **Exit chat mode** — type `/chat-exit` and press **Return** to return to normal smart-routing.
 6. Press **⌘,** to open Settings and add an AI provider key.

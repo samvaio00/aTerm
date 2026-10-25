@@ -191,10 +191,13 @@ struct ModernCommandPalette: View {
             .init(id: "agent-picker", label: "Launch Agent", subtitle: "Start an AI agent session", icon: "bolt", shortcut: nil) { dismiss(); windowModel.openAgentPicker() },
             .init(id: "find", label: "Find in Scrollback", subtitle: "Search terminal output", icon: "magnifyingglass", shortcut: "⌘F") { windowModel.toggleSearchBar(); dismiss() },
             .init(id: "clear", label: "Clear Scrollback", subtitle: "Clear terminal history", icon: "trash", shortcut: "⌘K") { windowModel.clearSelectedScrollback(); dismiss() },
+            .init(id: "explain-failure", label: "Explain Last Error", subtitle: "Ask AI why the last command failed", icon: "exclamationmark.bubble", shortcut: nil) { appModel.explainLastFailure(for: windowModel.selectedTab?.activePane); dismiss() },
+            .init(id: "fix-last-command", label: "Fix Last Command", subtitle: "Generate a corrected version of the last failed command", icon: "wrench", shortcut: nil) { appModel.fixLastCommand(for: windowModel.selectedTab?.activePane); dismiss() },
             .init(id: "split-h", label: "Split Horizontally", subtitle: "Split pane side by side", icon: "rectangle.split.2x1", shortcut: "⌘D") { windowModel.splitSelectedPane(.horizontal); dismiss() },
             .init(id: "split-v", label: "Split Vertically", subtitle: "Split pane top/bottom", icon: "rectangle.split.1x2", shortcut: "⌘⇧D") { windowModel.splitSelectedPane(.vertical); dismiss() },
             .init(id: "settings", label: "Settings", subtitle: "Open preferences", icon: "gear", shortcut: "⌘,") { NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil); dismiss() },
             .init(id: "shell-integration", label: "Install Shell Integration", subtitle: "Enable shell hooks", icon: "terminal", shortcut: nil) { appModel.installShellIntegration(); dismiss() },
+            .init(id: "refresh-ollama", label: "Refresh Ollama Models", subtitle: "Re-scan local Ollama models", icon: "arrow.clockwise", shortcut: nil) { Task { await appModel.refreshOllamaModels() }; dismiss() },
         ]
         + appModel.allThemes.map { theme in
             PaletteAction(id: "theme-\(theme.id)", label: "Theme: \(theme.name)", subtitle: "Change color scheme", icon: "paintbrush", shortcut: nil) {
