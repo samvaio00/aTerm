@@ -2,7 +2,7 @@ import Foundation
 
 enum BuiltinProviders {
     static let all: [ModelProvider] = [
-        provider(id: "ollama", name: "Ollama (local)", endpoint: "http://localhost:11434/v1/chat/completions", authType: .none, apiFormat: .openAICompatible, models: []),
+        provider(id: "ollama", name: "Ollama (local)", endpoint: "http://127.0.0.1:11434/v1/chat/completions", authType: .none, apiFormat: .openAICompatible, models: []),
         provider(id: "llamacpp", name: "llama.cpp (local)", endpoint: "http://localhost:8080/v1/chat/completions", authType: .none, apiFormat: .openAICompatible, models: []),
         provider(
             id: "anthropic",

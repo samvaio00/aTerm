@@ -243,7 +243,8 @@ final class AppModel: ObservableObject {
         }
 
         if let ollama = provider(for: "ollama"), !ollama.models.isEmpty {
-            return (ollama, ollama.models.first?.id)
+            let preferred = ollama.models.first(where: { !$0.id.lowercased().contains("cloud") }) ?? ollama.models.first
+            return (ollama, preferred?.id)
         }
 
         return (nil, nil)
@@ -847,7 +848,7 @@ final class AppModel: ObservableObject {
         guard let ollamaProvider = providers.first(where: { $0.id == "ollama" }) else { return }
 
         // Probe Ollama API for running models
-        guard let url = URL(string: "http://localhost:11434/api/tags") else { return }
+        guard let url = URL(string: "http://127.0.0.1:11434/api/tags") else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = 3
 
@@ -882,6 +883,9 @@ final class AppModel: ObservableObject {
             providers.removeAll(where: { $0.id == "ollama" })
             providers.append(updated)
 
+            // Prefer a local (non-cloud) model when available.
+            let preferredModel = updated.models.first(where: { !$0.id.lowercased().contains("cloud") }) ?? updated.models.first
+
             // Auto-select Ollama as the default provider when nothing is configured yet
             // or the current default requires credentials that are not stored.
             let currentProvider = provider(for: defaultProviderID)
@@ -889,7 +893,7 @@ final class AppModel: ObservableObject {
             let currentHasCredential = !((try? keychainStore.readSecret(account: defaultProviderID ?? "")) ?? "").isEmpty
             if defaultProviderID == nil || (currentNeedsCredential && !currentHasCredential) {
                 defaultProviderID = "ollama"
-                defaultModelID = updated.models.first?.id
+                defaultModelID = preferredModel?.id
                 for tab in tabs {
                     for pane in tab.panes {
                         pane.appearance.aiProvider = "ollama"
@@ -898,7 +902,7 @@ final class AppModel: ObservableObject {
                     refreshProviderLabel(for: tab)
                 }
             } else if defaultProviderID == "ollama" && defaultModelID == nil {
-                defaultModelID = updated.models.first?.id
+                defaultModelID = preferredModel?.id
             }
             persistProviders()
             tabs.forEach(applyDefaultProviderIfNeeded(to:))
