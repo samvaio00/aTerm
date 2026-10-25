@@ -228,6 +228,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Returns an AI provider/model that can actually be used for this pane.
+    /// Falls back to local Ollama when the configured provider requires missing credentials.
+    func usableAIProviderAndModel(for pane: TerminalPaneViewModel) -> (provider: ModelProvider?, modelID: String?) {
+        let configuredProvider = provider(for: pane.appearance.aiProvider)
+        let configuredModelID = pane.appearance.aiModel ?? pane.appearance.classifierModel
+
+        if let configuredProvider {
+            let needsCredential = configuredProvider.authType != .none
+            let hasCredential = !((try? keychainStore.readSecret(account: configuredProvider.id)) ?? "").isEmpty
+            if !needsCredential || hasCredential {
+                return (configuredProvider, configuredModelID ?? configuredProvider.models.first?.id)
+            }
+        }
+
+        if let ollama = provider(for: "ollama"), !ollama.models.isEmpty {
+            return (ollama, ollama.models.first?.id)
+        }
+
+        return (nil, nil)
+    }
+
     func splitSelectedPane(_ orientation: PaneSplitOrientation) {
         selectedTab?.splitActivePane(orientation: orientation)
         persistTabs()
@@ -480,8 +501,8 @@ final class AppModel: ObservableObject {
         let displayInput = inputClassifier.strippedOverrideInput(rawInput)
 
         Task { @MainActor in
-            let provider = self.provider(for: pane.appearance.aiProvider)
-            let classifierModelID = pane.appearance.classifierModel ?? pane.appearance.aiModel
+            let (provider, classifierModelIDOpt) = self.usableAIProviderAndModel(for: pane)
+            let classifierModelID = classifierModelIDOpt ?? pane.appearance.classifierModel ?? pane.appearance.aiModel
 
             do {
                 let result = try await inputClassifier.classify(
@@ -1090,8 +1111,9 @@ final class AppModel: ObservableObject {
     private func generateShellCommand(from input: String, for pane: TerminalPaneViewModel) async {
         pane.aiShellState = AIShellState(originalPrompt: input, generatedCommand: "", isGenerating: true, isEditing: false)
 
-        guard let provider = provider(for: pane.appearance.aiProvider),
-              let modelID = pane.appearance.aiModel else {
+        let (providerOpt, modelOpt) = usableAIProviderAndModel(for: pane)
+        guard let provider = providerOpt,
+              let modelID = modelOpt else {
             pane.aiShellState = AIShellState(
                 originalPrompt: input,
                 generatedCommand: "No provider or model configured.",
@@ -1138,8 +1160,9 @@ final class AppModel: ObservableObject {
             return
         }
 
-        guard let provider = provider(for: pane.appearance.aiProvider),
-              let modelID = pane.appearance.aiModel else {
+        let (providerOpt, modelOpt) = usableAIProviderAndModel(for: pane)
+        guard let provider = providerOpt,
+              let modelID = modelOpt else {
             pane.writeTerminalText("\nai> No provider or model configured for query mode.\n")
             return
         }
@@ -1187,15 +1210,30 @@ final class AppModel: ObservableObject {
         if let chatProviderID = pane.chatProviderID,
            let chatModelID = pane.chatModelID,
            let chatProvider = self.provider(for: chatProviderID) {
-            provider = chatProvider
-            modelID = chatModelID
-        } else if let defaultProvider = self.provider(for: pane.appearance.aiProvider),
-                  let defaultModel = pane.appearance.aiModel {
-            provider = defaultProvider
-            modelID = defaultModel
+            let needsCredential = chatProvider.authType != .none
+            let hasCredential = !((try? keychainStore.readSecret(account: chatProvider.id)) ?? "").isEmpty
+            if !needsCredential || hasCredential {
+                provider = chatProvider
+                modelID = chatModelID
+            } else {
+                let (fallbackProvider, fallbackModel) = usableAIProviderAndModel(for: pane)
+                if let fallbackProvider, let fallbackModel {
+                    provider = fallbackProvider
+                    modelID = fallbackModel
+                } else {
+                    pane.writeTerminalText("\nai> No provider or model configured for chat mode. Set up chat model in Settings.\n")
+                    return
+                }
+            }
         } else {
-            pane.appendChatAssistantResponse("No provider or model configured for chat mode. Set up chat model in Settings.")
-            return
+            let (fallbackProvider, fallbackModel) = usableAIProviderAndModel(for: pane)
+            if let fallbackProvider, let fallbackModel {
+                provider = fallbackProvider
+                modelID = fallbackModel
+            } else {
+                pane.writeTerminalText("\nai> No provider or model configured for chat mode. Set up chat model in Settings.\n")
+                return
+            }
         }
 
         do {
