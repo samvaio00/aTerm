@@ -563,7 +563,7 @@ private struct ModernPaneHeader: View {
             // Info section
             HStack(spacing: DesignSystem.Spacing.m) {
                 // Mode indicator (only when AI routing is active or a non-shell mode is shown)
-                if pane.aiRoutingMode == .smart || pane.modeIndicatorText != "TERMINAL" {
+                if pane.modeIndicatorText != "TERMINAL" {
                     HStack(spacing: 4) {
                         modeIcon
                         Text(pane.modeIndicatorText)

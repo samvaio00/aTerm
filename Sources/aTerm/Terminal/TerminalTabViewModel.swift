@@ -40,7 +40,7 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     @Published var aiShellState = AIShellState()
     @Published var submissionState: InputSubmissionState = .idle
     @Published var modeIndicatorText: String = "TERMINAL"
-    @Published var aiRoutingMode: AIRoutingMode = .shell
+    @Published var aiRoutingMode: AIRoutingMode = .smart
     @Published var agentExitBanner: String?
     @Published var isAgentAutoRestartEnabled = false
     @Published var isSearchPresented = false
