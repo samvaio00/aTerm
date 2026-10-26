@@ -148,6 +148,73 @@ struct ClassifierTests {
         #expect(result != nil)
         #expect(result?.mode == .query)
         #expect(result?.confidence == .certain)
+
+        let questionPrefixResult = try await classifier.classify(
+            "? how do I undo a commit",
+            context: context,
+            provider: nil,
+            modelID: nil
+        )
+        #expect(questionPrefixResult?.mode == .query)
+        #expect(questionPrefixResult?.confidence == .certain)
+        #expect(classifier.strippedOverrideInput("? how do I undo a commit") == "how do I undo a commit")
+
+        let askSlashResult = try await classifier.classify(
+            "/ask what is a file descriptor",
+            context: context,
+            provider: nil,
+            modelID: nil
+        )
+        #expect(askSlashResult?.mode == .query)
+        #expect(askSlashResult?.confidence == .certain)
+        #expect(classifier.strippedOverrideInput("/ask what is a file descriptor") == "what is a file descriptor")
+
+        let cmdSlashResult = try await classifier.classify(
+            "/cmd list open ports",
+            context: context,
+            provider: nil,
+            modelID: nil
+        )
+        #expect(cmdSlashResult?.mode == .aiToShell)
+        #expect(cmdSlashResult?.confidence == .certain)
+        #expect(classifier.strippedOverrideInput("/cmd list open ports") == "list open ports")
+
+        let doubleQuestionResult = try await classifier.classify(
+            "?? find largest files in current directory",
+            context: context,
+            provider: nil,
+            modelID: nil
+        )
+        #expect(doubleQuestionResult?.mode == .aiToShell)
+        #expect(doubleQuestionResult?.confidence == .certain)
+        #expect(classifier.strippedOverrideInput("?? find largest files in current directory") == "find largest files in current directory")
+    }
+
+    @Test
+    func fastClassifySynchronouslyResolvesShellAndAI() {
+        let classifier = InputClassifier()
+        let context = ClassificationContext()
+        ClassificationFeedbackStore.shared.clearAll()
+
+        // Standard commands, builtins, and common aliases should resolve to .terminal immediately
+        for shellCmd in ["ls", "ls -la", "pwd", "cd ..", "git status", "git commit -m 'fix'", "ll", "gst", "sudo ls"] {
+            let res = classifier.fastClassify(shellCmd, context: context, routingMode: .smart)
+            #expect(res?.mode == .terminal, "Expected '\(shellCmd)' to fast-classify as .terminal")
+        }
+
+        // Natural language questions and command requests should resolve immediately without an LLM call
+        let queryRes = classifier.fastClassify("how do I check open ports on macOS?", context: context, routingMode: .smart)
+        #expect(queryRes?.mode == .query)
+
+        let aiCmdRes = classifier.fastClassify("find my largest log files in this directory", context: context, routingMode: .smart)
+        #expect(aiCmdRes?.mode == .aiToShell)
+
+        // Shell-only routing mode routes unprefixed prose to .terminal while respecting explicit prefixes
+        let shellOnlyRes = classifier.fastClassify("find my largest log files", context: context, routingMode: .shell)
+        #expect(shellOnlyRes?.mode == .terminal)
+
+        let forcedInShellOnly = classifier.fastClassify("? what is launchd", context: context, routingMode: .shell)
+        #expect(forcedInShellOnly?.mode == .query)
     }
     
     // MARK: - AI-to-Shell Classification Tests

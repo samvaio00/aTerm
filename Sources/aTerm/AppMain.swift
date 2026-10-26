@@ -97,6 +97,13 @@ struct ATermApp: App {
                 }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
             }
+
+            CommandGroup(replacing: .help) {
+                Button("aTerm Usage & /Commands Guide") {
+                    NotificationCenter.default.post(name: .aTermToggleHelp, object: nil)
+                }
+                .keyboardShortcut("/", modifiers: [.command, .shift])
+            }
         }
 
         Settings {
@@ -142,4 +149,5 @@ extension Notification.Name {
     static let aTermCommandPalette = Notification.Name("aTermCommandPalette")
     static let aTermSaveOutput = Notification.Name("aTermSaveOutput")
     static let aTermOpenDirectory = Notification.Name("aTermOpenDirectory")
+    static let aTermToggleHelp = Notification.Name("aTermToggleHelp")
 }

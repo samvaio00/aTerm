@@ -9,6 +9,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
     case agents
     case mcp
     case shortcuts
+    case help
 
     var id: String { rawValue }
 
@@ -20,6 +21,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
         case .agents: return "Agents"
         case .mcp: return "MCP"
         case .shortcuts: return "Shortcuts"
+        case .help: return "Help & /Commands"
         }
     }
 
@@ -31,6 +33,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
         case .agents: return "bolt"
         case .mcp: return "server.rack"
         case .shortcuts: return "keyboard"
+        case .help: return "questionmark.circle"
         }
     }
 }
@@ -64,6 +67,8 @@ struct SettingsView: View {
                     MCPSettingsTab()
                 case .shortcuts:
                     KeybindingsSettingsTab()
+                case .help:
+                    HelpSettingsTab()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

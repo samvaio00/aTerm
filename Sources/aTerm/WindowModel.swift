@@ -12,6 +12,7 @@ final class WindowModel: ObservableObject, Identifiable {
     @Published var isModelPickerPresented = false
     @Published var isAgentPickerPresented = false
     @Published var isCommandPalettePresented = false
+    @Published var isHelpPresented = false
     private var didRestore = false
 
     var selectedTab: TerminalTabViewModel? {
@@ -132,6 +133,9 @@ final class WindowModel: ObservableObject, Identifiable {
 
     func splitSelectedPane(_ orientation: PaneSplitOrientation) {
         selectedTab?.splitActivePane(orientation: orientation)
+        if let selectedTab {
+            configure(selectedTab)
+        }
         persistTabs()
     }
 
@@ -313,10 +317,8 @@ final class WindowModel: ObservableObject, Identifiable {
         // Set up chat request callback for each pane
         for pane in tab.panes {
             pane.onChatRequest = { [weak self, weak pane] message in
-                Task { @MainActor [weak self, weak pane] in
-                    guard let self, let pane else { return }
-                    await self.appModel.answerChatQuery(message, for: pane)
-                }
+                guard let self, let pane else { return }
+                self.appModel.handleChatMessage(message, for: pane)
             }
             pane.onSubmitSmartLine = { [weak self, weak pane] line in
                 guard let self, let pane else { return }

@@ -189,16 +189,31 @@ final class TerminalBuffer {
 
     /// Column where user typing begins after the prompt (set by OSC 133 B when shell integration emits it).
     private(set) var shellInputStartColumn: Int?
+    /// Screen row where user typing begins after the prompt.
+    private(set) var shellInputStartRow: Int?
+    /// True when the shell is sitting at an interactive prompt waiting for a command; false while a foreground command is running (between OSC 133 C and OSC 133 A/B).
+    private(set) var isAtShellPrompt: Bool = true
 
     func markPromptStart() {
+        isAtShellPrompt = true
         shellInputStartColumn = nil
+        shellInputStartRow = nil
         let absoluteLine = mainScrollback.count + cursorY
         promptMarks.append(PromptMark(scrollbackLine: absoluteLine))
         markDirty()
     }
 
     func markPromptInputStart() {
+        isAtShellPrompt = true
         shellInputStartColumn = cursorX
+        shellInputStartRow = cursorY
+        markDirty()
+    }
+
+    func markCommandOutputStart() {
+        isAtShellPrompt = false
+        shellInputStartColumn = nil
+        shellInputStartRow = nil
         markDirty()
     }
 
@@ -228,22 +243,63 @@ final class TerminalBuffer {
         return result
     }
 
+    /// Finds the end column of user-typed text on `row`, extending past `cursorCol` if the user moved the cursor left to edit mid-line, while stopping before any wide gap (3+ spaces) that precedes a right-aligned RPROMPT.
+    private static func effectiveInputEndColumn(in row: [TerminalCell], startCol: Int, cursorCol: Int, maxCols: Int) -> Int {
+        let limit = min(maxCols, row.count)
+        var endCol = min(max(startCol, cursorCol), limit)
+        var col = endCol
+        var consecutiveSpaces = 0
+        while col < limit {
+            let ch = row[col].character
+            if ch == " " {
+                consecutiveSpaces += 1
+                if consecutiveSpaces >= 3 {
+                    break
+                }
+            } else {
+                consecutiveSpaces = 0
+                endCol = col + 1
+            }
+            col += 1
+        }
+        return endCol
+    }
+
     /// User-typed portion of the current line for smart submit (classification), using OSC 133 B when available.
     func userInputForSmartClassification() -> String {
-        guard !isAlternateScreen else { return "" }
+        guard !isAlternateScreen, isAtShellPrompt else { return "" }
         guard cursorY >= 0 && cursorY < rows else { return "" }
+
+        if let markedCol = shellInputStartColumn {
+            let startRow = max(0, min(shellInputStartRow ?? cursorY, cursorY))
+            if startRow < cursorY {
+                var combined = ""
+                for r in startRow...cursorY {
+                    let row = screen[r]
+                    let sCol = (r == startRow) ? max(0, min(markedCol, columns)) : 0
+                    let eCol = (r == cursorY)
+                        ? Self.effectiveInputEndColumn(in: row, startCol: sCol, cursorCol: cursorX, maxCols: columns)
+                        : columns
+                    let part = Self.string(from: row, startColumn: sCol, endColumn: eCol)
+                    if r < cursorY {
+                        combined += part.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+                    } else {
+                        combined += part
+                    }
+                }
+                return combined.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                let row = screen[cursorY]
+                let startCol = max(0, min(markedCol, columns))
+                let endCol = Self.effectiveInputEndColumn(in: row, startCol: startCol, cursorCol: cursorX, maxCols: columns)
+                let raw = Self.string(from: row, startColumn: startCol, endColumn: endCol)
+                return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
         let row = screen[cursorY]
-        let endCol = min(cursorX, columns)
-        let startCol: Int
-        if let marked = shellInputStartColumn, marked >= 0, marked <= endCol {
-            startCol = marked
-        } else {
-            startCol = 0
-        }
-        let raw = Self.string(from: row, startColumn: startCol, endColumn: endCol)
-        if shellInputStartColumn != nil {
-            return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
+        let endCol = Self.effectiveInputEndColumn(in: row, startCol: 0, cursorCol: cursorX, maxCols: columns)
+        let raw = Self.string(from: row, startColumn: 0, endColumn: endCol)
         return Self.approximateUserInputFromDisplayedLine(raw)
     }
 
@@ -544,6 +600,9 @@ final class TerminalBuffer {
                 if mainScrollback.count > scrollbackLimit {
                     mainScrollback.removeFirst(mainScrollback.count - scrollbackLimit)
                 }
+                if scrollTop == 0, let startRow = shellInputStartRow {
+                    shellInputStartRow = max(0, startRow - 1)
+                }
             }
         }
         markDirty()
@@ -633,6 +692,9 @@ final class TerminalBuffer {
         scrollTop = 0
         scrollBottom = rows - 1
         isAlternateScreen = false
+        isAtShellPrompt = true
+        shellInputStartColumn = nil
+        shellInputStartRow = nil
         mainScreen = Self.makeEmptyScreen(columns: columns, rows: rows)
         altScreen = Self.makeEmptyScreen(columns: columns, rows: rows)
         mainScrollback.removeAll()

@@ -202,29 +202,60 @@ final class AppModel: ObservableObject {
     }
 
     /// Asks the AI to explain the most recent failed command and suggest a fix.
-    func explainLastFailure(for pane: TerminalPaneViewModel?) {
+    func explainLastFailure(for pane: TerminalPaneViewModel?, customQuestion: String? = nil, inlinePrepared: Bool = false) {
         guard let pane else { return }
+        if !inlinePrepared {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: false)
+        }
         let ctx = pane.terminalContext()
         var prompt = "Explain why the last command failed and suggest a concrete fix or corrected command."
+        if let customQuestion, !customQuestion.isEmpty {
+            prompt += "\nUser note: \(customQuestion)"
+        }
         if let last = ctx.lastCommands.last { prompt += "\nLast command: \(last)" }
         if let code = ctx.lastExitCode { prompt += "\nExit code: \(code)" }
         if !ctx.recentFailures.isEmpty { prompt += "\nRecent failures: \(ctx.recentFailures.joined(separator: ", "))" }
         if !ctx.lastOutputSnippet.isEmpty { prompt += "\nTerminal output (tail): \(ctx.lastOutputSnippet)" }
-        Task { @MainActor in
-            await answerQuery(prompt, for: pane)
+        pane.activeAITask?.cancel()
+        pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+            guard let self, let pane else { return }
+            await self.answerQuery(prompt, for: pane, inlinePrepared: true)
         }
     }
 
     /// Generates a corrected version of the most recent failed command.
-    func fixLastCommand(for pane: TerminalPaneViewModel?) {
+    func fixLastCommand(for pane: TerminalPaneViewModel?, customHint: String? = nil, inlinePrepared: Bool = false) {
         guard let pane else { return }
+        if !inlinePrepared {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: false)
+        }
         let ctx = pane.terminalContext()
-        guard let last = ctx.lastCommands.last else { return }
+        let lastCommand = ctx.recentFailures.last ?? ctx.lastCommands.last
+        guard let last = lastCommand else {
+            pane.writeTerminalText("\u{1B}[33mNo recent command in history to fix.\u{1B}[0m\r\n")
+            pane.finishInlineAIOutput()
+            return
+        }
         var request = "Fix the failed command: \(last)"
         if let code = ctx.lastExitCode { request += " (exit code \(code))" }
+        if let customHint, !customHint.isEmpty { request += ". Hint: \(customHint)" }
         if !ctx.lastOutputSnippet.isEmpty { request += ". Terminal output: \(ctx.lastOutputSnippet)" }
-        Task { @MainActor in
-            await generateShellCommand(from: request, for: pane)
+        pane.activeAITask?.cancel()
+        pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+            guard let self, let pane else { return }
+            pane.writeTerminalText("\u{1B}[33m⚡ Generating fix for `\(last)`...\u{1B}[0m")
+            await self.generateShellCommand(from: request, for: pane, showOverlayCard: false)
+            guard !Task.isCancelled else { return }
+            pane.clearCurrentTerminalLine()
+            let generated = pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+            pane.aiShellState = AIShellState()
+            if generated.isEmpty || generated.hasPrefix("Generation failed") || generated.hasPrefix("No provider") {
+                pane.writeTerminalText("\u{1B}[31m\(generated.isEmpty ? "Could not generate a fix." : generated)\u{1B}[0m\r\n")
+                pane.finishInlineAIOutput()
+            } else {
+                pane.writeTerminalText("\u{1B}[32;1m✦ Suggested fix:\u{1B}[0m \u{1B}[1m\(generated)\u{1B}[0m \u{1B}[90m(press Return to run)\u{1B}[0m\r\n")
+                pane.prefillShellPrompt(with: generated)
+            }
         }
     }
 
@@ -252,6 +283,9 @@ final class AppModel: ObservableObject {
 
     func splitSelectedPane(_ orientation: PaneSplitOrientation) {
         selectedTab?.splitActivePane(orientation: orientation)
+        if let selectedTab {
+            configure(selectedTab)
+        }
         persistTabs()
     }
 
@@ -453,69 +487,169 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let lowerInput = rawInput.lowercased()
+
+        // 1. Handle inline slash commands (/exit, /chat, /explain, /fix, /model, /clear, /help)
         if inputClassifier.isChatExitCommand(rawInput) {
-            pane.exitChatMode()
+            if pane.isChatModeActive {
+                pane.exitChatMode()
+            } else if lineAlreadyBufferedInShell {
+                pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: true)
+                pane.writeTerminalText("\u{1B}[90mNot in chat mode. Use `exit` to close the shell.\u{1B}[0m\r\n")
+                pane.finishInlineAIOutput()
+            }
             return
         }
 
         if inputClassifier.isChatCommand(rawInput) {
             let displayInput = inputClassifier.strippedOverrideInput(rawInput)
-            pane.enterChatMode(providerID: pane.appearance.chatProvider, modelID: pane.appearance.chatModel)
-            if lineAlreadyBufferedInShell {
-                pane.sendShellKillLineToPTY()
-                pane.sendBufferedReturnToShell()
-            }
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            pane.enterChatMode(
+                providerID: pane.appearance.chatProvider,
+                modelID: pane.appearance.chatModel,
+                showInitialPrompt: displayInput.isEmpty
+            )
             if !displayInput.isEmpty {
-                Task { @MainActor in
-                    await answerChatQuery(displayInput, for: pane)
+                pane.writeTerminalText("\u{1B}[32;1mchat>\u{1B}[0m \(displayInput)\r\n")
+                pane.activeAITask?.cancel()
+                pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+                    guard let self, let pane else { return }
+                    await self.answerChatQuery(displayInput, for: pane)
                 }
             }
             return
         }
 
-        if pane.isChatModeActive {
+        if lowerInput == "/explain" || lowerInput.hasPrefix("/explain ") || lowerInput == "/why" || lowerInput.hasPrefix("/why ") || lowerInput == "explain" {
+            let customNote = rawInput.drop(while: { !$0.isWhitespace }).trimmingCharacters(in: .whitespacesAndNewlines)
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            explainLastFailure(for: pane, customQuestion: customNote.isEmpty ? nil : customNote, inlinePrepared: true)
+            return
+        }
+
+        if lowerInput == "/fix" || lowerInput.hasPrefix("/fix ") || lowerInput == "fix" {
+            let customHint = rawInput.drop(while: { !$0.isWhitespace }).trimmingCharacters(in: .whitespacesAndNewlines)
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            fixLastCommand(for: pane, customHint: customHint.isEmpty ? nil : customHint, inlinePrepared: true)
+            return
+        }
+
+        if lowerInput == "/clear" || lowerInput == "/reset" {
+            pane.conversationHistory.clear()
+            pane.chatConversationHistory.clear()
+            pane.clearAssistantState()
+            pane.clearScrollback()
             if lineAlreadyBufferedInShell {
-                pane.sendShellKillLineToPTY()
-                pane.sendBufferedReturnToShell()
-            }
-            Task { @MainActor in
-                await answerChatQuery(rawInput, for: pane)
+                pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: true)
+                pane.finishInlineAIOutput()
             }
             return
         }
 
-        // Prompt-only UX: unprefixed lines run directly in shell.
-        // Smart routing from the prompt is opt-in via explicit prefixes (!, >, $) or /chat.
-        if lineAlreadyBufferedInShell {
-            let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
-            let isExplicitSmartLine = trimmed.first.map { ["!", ">", "$"].contains($0) } ?? false
-            let shellScore = ShellSyntaxAnalyzer.analyze(trimmed).shellScore
-            let isLikelyShell = shellScore > 0.5
-            let shouldClassify = isExplicitSmartLine || (pane.aiRoutingMode == .smart && !isLikelyShell)
-            if !shouldClassify {
-                pane.clearAssistantState()
-                pane.sendBufferedReturnToShell()
-                return
+        if lowerInput == "/model" || lowerInput == "/models" || lowerInput.hasPrefix("/model ") || lowerInput.hasPrefix("/models ") {
+            let query = rawInput.drop(while: { !$0.isWhitespace }).trimmingCharacters(in: .whitespacesAndNewlines)
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            handleInlineModelCommand(query: query, for: pane)
+            pane.finishInlineAIOutput()
+            return
+        }
+
+        if lowerInput == "/smart" || lowerInput == "/mode smart" {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            pane.aiRoutingMode = .smart
+            pane.writeTerminalText("\u{1B}[32;1m✦ Routing mode set to Smart:\u{1B}[0m natural language routes to AI automatically; shell commands run directly in zsh.\r\n")
+            pane.finishInlineAIOutput()
+            return
+        }
+
+        if lowerInput == "/shell" || lowerInput == "/mode shell" {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            pane.aiRoutingMode = .shell
+            pane.writeTerminalText("\u{1B}[36;1m✦ Routing mode set to Shell-only:\u{1B}[0m unprefixed lines go directly to zsh; use \u{1B}[1m?\u{1B}[0m, \u{1B}[1m??\u{1B}[0m, \u{1B}[1m!\u{1B}[0m, or \u{1B}[1m/commands\u{1B}[0m for AI.\r\n")
+            pane.finishInlineAIOutput()
+            return
+        }
+
+        if lowerInput == "/mode" {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            let modeDesc = pane.aiRoutingMode == .smart
+                ? "\u{1B}[33;1mSmart\u{1B}[0m (natural language + shell commands)"
+                : "\u{1B}[36;1mShell-only\u{1B}[0m (pure zsh unless prefixed with ?, ??, !, or /)"
+            pane.writeTerminalText("\u{1B}[36;1mActive Routing Mode:\u{1B}[0m \(modeDesc)\r\n\u{1B}[90mRun `/smart` or `/shell` to switch.\u{1B}[0m\r\n")
+            pane.finishInlineAIOutput()
+            return
+        }
+
+        if lowerInput == "/help" || lowerInput == "/commands" || lowerInput == "/ai" || lowerInput == "/?" {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            writeInlineAIHelp(to: pane)
+            pane.finishInlineAIOutput()
+            return
+        }
+
+        if pane.isChatModeActive {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            pane.activeAITask?.cancel()
+            pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+                guard let self, let pane else { return }
+                await self.answerChatQuery(rawInput, for: pane)
             }
+            return
         }
 
         let displayInput = inputClassifier.strippedOverrideInput(rawInput)
+        let trimmedRaw = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        Task { @MainActor in
+        // Synchronous pre-parse: immediately route shell commands to PTY with zero AI delay,
+        // and immediately route clear AI requests to their handler without a redundant LLM classification round-trip.
+        if let fastResult = inputClassifier.fastClassify(trimmedRaw, context: pane.terminalContext(), routingMode: pane.aiRoutingMode) {
+            Log.debug("classifier", "Fast-path: '\(displayInput)' -> \(fastResult.mode.rawValue) (\(fastResult.confidence.description): \(String(format: "%.2f", fastResult.score)))")
+            if fastResult.mode == .terminal && !inputClassifier.isDangerousCommand(displayInput) && !trimmedRaw.hasPrefix("$") {
+                pane.clearAssistantState()
+                if lineAlreadyBufferedInShell {
+                    pane.sendBufferedReturnToShell(commandForHistory: displayInput)
+                } else {
+                    pane.sendTerminalCommand(displayInput)
+                }
+                return
+            }
+
+            if fastResult.mode != .terminal {
+                pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
+            }
+            pane.activeAITask?.cancel()
+            pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+                guard let self, let pane else { return }
+                await self.executeClassificationResult(
+                    fastResult,
+                    input: displayInput,
+                    rawInput: rawInput,
+                    pane: pane,
+                    lineAlreadyBufferedInShell: lineAlreadyBufferedInShell,
+                    inlinePrepared: fastResult.mode != .terminal
+                )
+            }
+            return
+        }
+
+        pane.activeAITask?.cancel()
+        pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+            guard let self, let pane else { return }
             let (provider, classifierModelIDOpt) = self.usableAIProviderAndModel(for: pane)
             let classifierModelID = classifierModelIDOpt ?? pane.appearance.classifierModel ?? pane.appearance.aiModel
 
             do {
-                let result = try await inputClassifier.classify(
+                let result = try await self.inputClassifier.classify(
                     rawInput,
                     context: pane.terminalContext(),
                     provider: provider,
                     modelID: classifierModelID
                 )
+                guard !Task.isCancelled else { return }
 
                 guard let result else {
                     if lineAlreadyBufferedInShell {
-                        pane.sendShellKillLineToPTY()
+                        pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: true)
                     }
                     pane.submissionState = .waitingForDisambiguation(displayInput)
                     pane.modeIndicatorText = "AMBIGUOUS"
@@ -525,7 +659,7 @@ final class AppModel: ObservableObject {
                 Log.debug("classifier", "Input: '\(displayInput)' -> \(result.mode.rawValue) (\(result.confidence.description): \(String(format: "%.2f", result.score)))")
                 Log.debug("classifier", "Reasons: \(result.explanation.reasons.joined(separator: "; "))")
 
-                await executeClassificationResult(
+                await self.executeClassificationResult(
                     result,
                     input: displayInput,
                     rawInput: rawInput,
@@ -533,13 +667,129 @@ final class AppModel: ObservableObject {
                     lineAlreadyBufferedInShell: lineAlreadyBufferedInShell
                 )
             } catch {
-                pane.queryResponse = QueryResponseState(
-                    text: "Classification failed: \(error.localizedDescription)",
-                    isStreaming: false,
-                    suggestions: []
-                )
+                guard !Task.isCancelled else { return }
+                if lineAlreadyBufferedInShell {
+                    pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: true)
+                    pane.writeTerminalText("\u{1B}[31mClassification failed: \(error.localizedDescription)\u{1B}[0m\r\n")
+                    pane.finishInlineAIOutput()
+                } else {
+                    pane.queryResponse = QueryResponseState(
+                        text: "Classification failed: \(error.localizedDescription)",
+                        isStreaming: false,
+                        suggestions: []
+                    )
+                }
                 pane.modeIndicatorText = "ERROR"
             }
+        }
+    }
+
+    private func handleInlineModelCommand(query: String, for pane: TerminalPaneViewModel) {
+        let items = modelPickerItems
+        if query.isEmpty {
+            let (activeProv, activeMod) = usableAIProviderAndModel(for: pane)
+            let currentLabel = activeProv != nil ? "\(activeProv!.name) · \(activeMod ?? "default")" : pane.activeProviderName
+            pane.writeTerminalText("\u{1B}[36;1mActive AI Model:\u{1B}[0m \(currentLabel)\r\n")
+            if !items.isEmpty {
+                let preview = items.prefix(8).map { "\($0.provider.id)/\($0.model.id)" }.joined(separator: ", ")
+                pane.writeTerminalText("\u{1B}[90mAvailable: \(preview)\(items.count > 8 ? ", ..." : "")\u{1B}[0m\r\n")
+                pane.writeTerminalText("\u{1B}[90mTip: Run `/model <name>` to switch inline or press ⌘M to open the model picker.\u{1B}[0m\r\n")
+            }
+            return
+        }
+
+        let needle = query.lowercased()
+        let match = items.first(where: {
+            $0.model.id.lowercased() == needle ||
+            $0.model.name.lowercased() == needle ||
+            "\($0.provider.id)/\($0.model.id)".lowercased() == needle
+        }) ?? items.first(where: {
+            $0.model.id.lowercased().contains(needle) ||
+            $0.model.name.lowercased().contains(needle) ||
+            $0.provider.id.lowercased().contains(needle) ||
+            $0.provider.name.lowercased().contains(needle)
+        })
+
+        if let match {
+            pane.appearance.aiProvider = match.provider.id
+            pane.appearance.aiModel = match.model.id
+            refreshProviderLabel(for: pane)
+            pane.markStateChanged()
+            pane.writeTerminalText("\u{1B}[32;1m✦ Switched AI model to:\u{1B}[0m \(match.provider.name) · \(match.model.name)\r\n")
+        } else {
+            pane.writeTerminalText("\u{1B}[33mNo model matching '\(query)' found.\u{1B}[0m\r\n")
+        }
+    }
+
+    func writeInlineAIHelp(to pane: TerminalPaneViewModel) {
+        let help = """
+        \u{1B}[36;1m╭──────────────────────────────────────────────────────────────────────────────╮\u{1B}[0m
+        \u{1B}[36;1m│                       aTerm Usage & /Commands Reference                      │\u{1B}[0m
+        \u{1B}[36;1m╰──────────────────────────────────────────────────────────────────────────────╯\u{1B}[0m
+        \u{1B}[1mHOW IT WORKS\u{1B}[0m
+          Type directly at your zsh prompt. Standard shell commands (\u{1B}[32mls\u{1B}[0m, \u{1B}[32mgit\u{1B}[0m, \u{1B}[32mvim\u{1B}[0m, pipes)
+          run natively in the PTY, while natural language & slash commands invoke AI inline.
+
+        \u{1B}[1mSLASH (/) COMMANDS\u{1B}[0m
+          \u{1B}[35;1m/help\u{1B}[0m, \u{1B}[35;1m/commands\u{1B}[0m, \u{1B}[35;1m/?\u{1B}[0m      Display this usage and command reference inline
+          \u{1B}[35;1m/chat [message]\u{1B}[0m          Enter multi-turn AI chat mode (or send an initial message)
+          \u{1B}[35;1m/exit\u{1B}[0m, \u{1B}[35;1m/chat-exit\u{1B}[0m        Exit AI chat mode and return to the zsh shell prompt
+          \u{1B}[35;1m/ask <question>\u{1B}[0m          Ask AI a question and stream the answer inline
+          \u{1B}[35;1m/cmd <task>\u{1B}[0m              Generate & run a shell command from natural language
+          \u{1B}[35;1m/explain [note]\u{1B}[0m          Explain why the last command failed and suggest a fix
+          \u{1B}[35;1m/fix [hint]\u{1B}[0m              Generate a corrected command and prefill your zsh prompt
+          \u{1B}[35;1m/model [name]\u{1B}[0m            Show active model or switch inline (e.g. \u{1B}[90m/model claude\u{1B}[0m)
+          \u{1B}[35;1m/smart\u{1B}[0m, \u{1B}[35;1m/shell\u{1B}[0m, \u{1B}[35;1m/mode\u{1B}[0m    Inspect or switch between Smart and Shell-only routing
+          \u{1B}[35;1m/clear\u{1B}[0m, \u{1B}[35;1m/reset\u{1B}[0m           Clear terminal scrollback and reset AI conversation memory
+
+        \u{1B}[1mINLINE SHORTHAND PREFIXES\u{1B}[0m
+          \u{1B}[36;1m? <question>\u{1B}[0m             Ask AI a question inline (also \u{1B}[36;1m!<question>\u{1B}[0m)
+          \u{1B}[33;1m?? <task>\u{1B}[0m                Generate & execute a zsh command (also \u{1B}[33;1m><task>\u{1B}[0m)
+          \u{1B}[32;1m$ <command>\u{1B}[0m              Force direct shell execution without AI classification
+          \u{1B}[35;1mexplain\u{1B}[0m / \u{1B}[35;1mfix\u{1B}[0m            Quick aliases for \u{1B}[35m/explain\u{1B}[0m and \u{1B}[35m/fix\u{1B}[0m after a non-zero exit
+
+        \u{1B}[1mKEYBOARD SHORTCUTS\u{1B}[0m
+          \u{1B}[90m⌘T\u{1B}[0m New Tab   \u{1B}[90m⌘D\u{1B}[0m Split Right   \u{1B}[90m⇧⌘D\u{1B}[0m Split Down   \u{1B}[90m⌘M\u{1B}[0m Model Picker   \u{1B}[90m⌘P\u{1B}[0m Command Palette
+          \u{1B}[90m⌘F\u{1B}[0m Find      \u{1B}[90m⌘K\u{1B}[0m Clear         \u{1B}[90m⌃C\u{1B}[0m Cancel AI     \u{1B}[90m⇧⌘/\u{1B}[0m Open Full Help Guide\r\n
+        """
+        pane.writeTerminalText(help)
+    }
+
+    func handleChatMessage(_ message: String, for pane: TerminalPaneViewModel) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+
+        if lower == "/help" || lower == "/commands" || lower == "/?" || lower == "/ai" {
+            writeInlineAIHelp(to: pane)
+            pane.showChatPrompt(leadingNewline: false)
+            return
+        }
+
+        if lower == "/model" || lower == "/models" || lower.hasPrefix("/model ") || lower.hasPrefix("/models ") {
+            let query = trimmed.drop(while: { !$0.isWhitespace }).trimmingCharacters(in: .whitespacesAndNewlines)
+            handleInlineModelCommand(query: query, for: pane)
+            pane.showChatPrompt(leadingNewline: false)
+            return
+        }
+
+        if lower == "/smart" || lower == "/mode smart" {
+            pane.aiRoutingMode = .smart
+            pane.writeTerminalText("\u{1B}[32;1m✦ Routing mode set to Smart.\u{1B}[0m\r\n")
+            pane.showChatPrompt(leadingNewline: false)
+            return
+        }
+
+        if lower == "/shell" || lower == "/mode shell" {
+            pane.aiRoutingMode = .shell
+            pane.writeTerminalText("\u{1B}[36;1m✦ Routing mode set to Shell-only.\u{1B}[0m\r\n")
+            pane.showChatPrompt(leadingNewline: false)
+            return
+        }
+
+        pane.activeAITask?.cancel()
+        pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+            guard let self, let pane else { return }
+            await self.answerChatQuery(trimmed, for: pane)
         }
     }
 
@@ -548,56 +798,82 @@ final class AppModel: ObservableObject {
         input: String,
         rawInput: String,
         pane: TerminalPaneViewModel,
-        lineAlreadyBufferedInShell: Bool
+        lineAlreadyBufferedInShell: Bool,
+        inlinePrepared: Bool = false
     ) async {
         switch result.mode {
         case .terminal:
             if inputClassifier.isDangerousCommand(input) {
-                pane.queryResponse = QueryResponseState(
-                    text: "⚠️ Warning: This command may be destructive. Press ⌘↵ to execute anyway, or try '!' prefix to ask about it.",
-                    isStreaming: false,
-                    suggestions: []
-                )
+                if lineAlreadyBufferedInShell {
+                    if !inlinePrepared {
+                        pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: true)
+                    }
+                    pane.writeTerminalText("\u{1B}[33;1m⚠️ Warning:\u{1B}[0m `\u{1B}[1m\(input)\u{1B}[0m` may be destructive. Pre-filling at prompt — press \u{1B}[1m$\(input)\u{1B}[0m or review carefully.\r\n")
+                    pane.prefillShellPrompt(with: input)
+                } else {
+                    pane.queryResponse = QueryResponseState(
+                        text: "⚠️ Warning: This command may be destructive. Press ⌘↵ to execute anyway, or try '!' prefix to ask about it.",
+                        isStreaming: false,
+                        suggestions: []
+                    )
+                }
                 pane.modeIndicatorText = "WARNING"
                 return
             }
 
             pane.clearAssistantState()
             if lineAlreadyBufferedInShell {
-                pane.sendBufferedReturnToShell()
+                // If user used an explicit '$' prefix, strip it and replace the buffered line
+                let trimmedRaw = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmedRaw.hasPrefix("$") {
+                    if !inlinePrepared {
+                        pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: true)
+                    }
+                    pane.executeGeneratedShellCommand(input)
+                } else {
+                    pane.sendBufferedReturnToShell(commandForHistory: input)
+                }
             } else {
                 pane.sendTerminalCommand(input)
             }
 
         case .aiToShell:
-            if lineAlreadyBufferedInShell {
-                pane.sendShellKillLineToPTY()
-                pane.sendBufferedReturnToShell()
+            if !inlinePrepared {
+                pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
             }
             pane.queryResponse = QueryResponseState()
             pane.submissionState = .idle
             pane.modeIndicatorText = "\(InputMode.aiToShell.rawValue) (\(result.confidence.description))"
-            await generateShellCommand(from: input, for: pane)
+            pane.writeTerminalText("\u{1B}[33m⚡ Generating command...\u{1B}[0m")
+            await generateShellCommand(from: input, for: pane, showOverlayCard: false)
+            guard !Task.isCancelled else { return }
+            pane.clearCurrentTerminalLine()
 
-            // Auto-run the generated command unless it looks dangerous, in which case
-            // keep the confirmation card so the user can review/edit.
             let generated = pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !generated.isEmpty,
-               !generated.hasPrefix("Generation failed"),
-               !inputClassifier.isDangerousCommand(generated) {
+            if generated.isEmpty || generated.hasPrefix("Generation failed") || generated.hasPrefix("No provider") {
                 pane.aiShellState = AIShellState()
-                pane.sendTerminalCommand(generated)
+                pane.writeTerminalText("\u{1B}[31m\(generated.isEmpty ? "Could not generate command." : generated)\u{1B}[0m\r\n")
+                pane.finishInlineAIOutput()
+            } else if inputClassifier.isDangerousCommand(generated) || !Self.hasBalancedQuotes(generated) || generated.contains("\n") {
+                pane.aiShellState = AIShellState()
+                if inputClassifier.isDangerousCommand(generated) {
+                    pane.writeTerminalText("\u{1B}[33;1m⚠️ Review potentially destructive command before running:\u{1B}[0m\r\n")
+                }
+                let singleLine = generated.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? generated
+                pane.prefillShellPrompt(with: singleLine)
+            } else {
+                pane.aiShellState = AIShellState()
+                pane.executeGeneratedShellCommand(generated)
             }
 
         case .query:
-            if lineAlreadyBufferedInShell {
-                pane.sendShellKillLineToPTY()
-                pane.sendBufferedReturnToShell()
+            if !inlinePrepared {
+                pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: lineAlreadyBufferedInShell)
             }
             pane.aiShellState = AIShellState()
             pane.submissionState = .idle
             pane.modeIndicatorText = "\(InputMode.query.rawValue) (\(result.confidence.description))"
-            await answerQuery(input, for: pane)
+            await answerQuery(input, for: pane, inlinePrepared: true)
         }
     }
 
@@ -615,16 +891,34 @@ final class AppModel: ObservableObject {
         switch mode {
         case .terminal:
             pane.clearAssistantState()
-            pane.sendTerminalCommand(input)
+            pane.executeGeneratedShellCommand(input)
         case .aiToShell:
             pane.modeIndicatorText = InputMode.aiToShell.rawValue
-            Task { @MainActor in
-                await generateShellCommand(from: input, for: pane)
+            pane.activeAITask?.cancel()
+            pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+                guard let self, let pane else { return }
+                pane.writeTerminalText("\u{1B}[33m⚡ Generating command...\u{1B}[0m")
+                await self.generateShellCommand(from: input, for: pane, showOverlayCard: false)
+                guard !Task.isCancelled else { return }
+                pane.clearCurrentTerminalLine()
+                let generated = pane.aiShellState.generatedCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+                pane.aiShellState = AIShellState()
+                if generated.isEmpty || generated.hasPrefix("Generation failed") || generated.hasPrefix("No provider") {
+                    pane.writeTerminalText("\u{1B}[31m\(generated.isEmpty ? "Could not generate command." : generated)\u{1B}[0m\r\n")
+                    pane.finishInlineAIOutput()
+                } else if self.inputClassifier.isDangerousCommand(generated) {
+                    pane.writeTerminalText("\u{1B}[33;1m⚠️ Review potentially destructive command before running:\u{1B}[0m\r\n")
+                    pane.prefillShellPrompt(with: generated)
+                } else {
+                    pane.executeGeneratedShellCommand(generated)
+                }
             }
         case .query:
             pane.modeIndicatorText = InputMode.query.rawValue
-            Task { @MainActor in
-                await answerQuery(input, for: pane)
+            pane.activeAITask?.cancel()
+            pane.activeAITask = Task { @MainActor [weak self, weak pane] in
+                guard let self, let pane else { return }
+                await self.answerQuery(input, for: pane, inlinePrepared: true)
             }
         }
     }
@@ -976,6 +1270,16 @@ final class AppModel: ObservableObject {
                 self.refreshProviderLabel(for: tab)
             }
         }
+        for pane in tab.panes {
+            pane.onChatRequest = { [weak self, weak pane] message in
+                guard let self, let pane else { return }
+                self.handleChatMessage(message, for: pane)
+            }
+            pane.onSubmitSmartLine = { [weak self, weak pane] line in
+                guard let self, let pane else { return }
+                self.submitSmartLineFromPrompt(line, for: pane)
+            }
+        }
     }
 
     private var lastAppliedConfigDirectories: [UUID: URL] = [:]
@@ -1122,8 +1426,61 @@ final class AppModel: ObservableObject {
         pane.setProviderLabel(providerName: provider?.name ?? pane.appearance.aiProvider, modelName: modelName)
     }
 
-    private func generateShellCommand(from input: String, for pane: TerminalPaneViewModel) async {
-        pane.aiShellState = AIShellState(originalPrompt: input, generatedCommand: "", isGenerating: true, isEditing: false)
+    private static func cleanGeneratedCommand(_ raw: String) -> String {
+        var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let fenceStart = cleaned.range(of: "```") {
+            let afterOpen = cleaned[fenceStart.upperBound...]
+            if let newlineIdx = afterOpen.firstIndex(of: "\n") {
+                let bodyStart = afterOpen.index(after: newlineIdx)
+                let remaining = afterOpen[bodyStart...]
+                if let fenceEnd = remaining.range(of: "```") {
+                    cleaned = String(remaining[..<fenceEnd.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                } else {
+                    cleaned = String(remaining).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+        if cleaned.hasPrefix("`") && cleaned.hasSuffix("`") && cleaned.count >= 2 && !cleaned.contains("\n") {
+            cleaned = String(cleaned.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if cleaned.hasPrefix("$ ") {
+            cleaned = String(cleaned.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if cleaned.hasPrefix("% ") {
+            cleaned = String(cleaned.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return cleaned
+    }
+
+    private static func hasBalancedQuotes(_ command: String) -> Bool {
+        var inSingle = false
+        var inDouble = false
+        var inBacktick = false
+        var escaped = false
+
+        for ch in command {
+            if escaped {
+                escaped = false
+                continue
+            }
+            if ch == "\\" && !inSingle {
+                escaped = true
+                continue
+            }
+            if ch == "'" && !inDouble && !inBacktick {
+                inSingle.toggle()
+            } else if ch == "\"" && !inSingle && !inBacktick {
+                inDouble.toggle()
+            } else if ch == "`" && !inSingle {
+                inBacktick.toggle()
+            }
+        }
+        return !inSingle && !inDouble && !inBacktick && !escaped
+    }
+
+    private func generateShellCommand(from input: String, for pane: TerminalPaneViewModel, showOverlayCard: Bool = true) async {
+        if showOverlayCard {
+            pane.aiShellState = AIShellState(originalPrompt: input, generatedCommand: "", isGenerating: true, isEditing: false)
+        }
 
         let (providerOpt, modelOpt) = usableAIProviderAndModel(for: pane)
         guard let provider = providerOpt,
@@ -1132,20 +1489,28 @@ final class AppModel: ObservableObject {
                 originalPrompt: input,
                 generatedCommand: "No provider or model configured.",
                 isGenerating: false,
-                isEditing: true
+                isEditing: showOverlayCard
             )
             return
         }
 
+        let ctx = pane.terminalContext()
         do {
-            let command = try await providerRouter.complete(
+            let rawCommand = try await providerRouter.complete(
                 provider: provider,
                 modelID: modelID,
                 messages: [
-                    ChatMessage(role: "system", content: "Convert the request into a single safe zsh command for the CURRENT directory only. Reply with only the command, no markdown, no explanation. Never use cd. Never search or list paths outside the current directory. Use relative paths and prefer ls/find scoped to ."),
-                    ChatMessage(role: "user", content: "cwd=\(pane.currentWorkingDirectory?.path ?? "")\nrequest=\(input)")
+                    ChatMessage(
+                        role: "system",
+                        content: "You are an expert macOS zsh command generator. Convert the user's request into a single executable zsh command (pipelines and && are allowed). Output ONLY the raw command with no markdown code fences, no backticks, and no explanation. Prefer the current directory (.) when no path is specified."
+                    ),
+                    ChatMessage(
+                        role: "user",
+                        content: "cwd=\(pane.currentWorkingDirectory?.path ?? ".")\ngitBranch=\(ctx.gitBranch ?? "none")\nproject=\(ctx.projectType.rawValue)\nrequest=\(input)"
+                    )
                 ]
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            let command = Self.cleanGeneratedCommand(rawCommand)
 
             pane.aiShellState = AIShellState(
                 originalPrompt: input,
@@ -1158,26 +1523,34 @@ final class AppModel: ObservableObject {
                 originalPrompt: input,
                 generatedCommand: "Generation failed: \(error.localizedDescription)",
                 isGenerating: false,
-                isEditing: true
+                isEditing: showOverlayCard
             )
         }
     }
 
-    private func answerQuery(_ input: String, for pane: TerminalPaneViewModel) async {
+    private func answerQuery(_ input: String, for pane: TerminalPaneViewModel, inlinePrepared: Bool = false) async {
         pane.queryResponse = QueryResponseState()
+        if !inlinePrepared {
+            pane.prepareForInlineAIOutput(lineAlreadyBufferedInShell: false)
+        }
+        defer {
+            if !Task.isCancelled {
+                pane.finishInlineAIOutput()
+            }
+        }
 
         // Try local MCP answer first (quick offline fallback)
         if let mcpAnswer = mcpHost.localFilesystemAnswer(question: input, cwd: pane.currentWorkingDirectory) {
             pane.conversationHistory.addUserMessage(input)
             pane.conversationHistory.addAssistantMessage(mcpAnswer)
-            pane.writeTerminalText("\nai> \(mcpAnswer)\n")
+            pane.writeTerminalText("\u{1B}[36;1mai>\u{1B}[0m \(mcpAnswer)\r\n")
             return
         }
 
         let (providerOpt, modelOpt) = usableAIProviderAndModel(for: pane)
         guard let provider = providerOpt,
               let modelID = modelOpt else {
-            pane.writeTerminalText("\nai> No provider or model configured for query mode.\n")
+            pane.writeTerminalText("\u{1B}[33mai> No AI provider or model configured. Open Settings (⌘,) or run /model to configure one.\u{1B}[0m\r\n")
             return
         }
 
@@ -1201,7 +1574,6 @@ final class AppModel: ObservableObject {
             let userMsg = "Last output (tail): \(ctx.lastOutputSnippet)\n\nQuestion: \(input)"
             pane.conversationHistory.addUserMessage(userMsg)
 
-            pane.writeTerminalText("\nai> ")
             _ = try await streamAIResponse(
                 provider: provider,
                 modelID: modelID,
@@ -1210,13 +1582,23 @@ final class AppModel: ObservableObject {
                 pane: pane,
                 useCard: false
             )
+        } catch is CancellationError {
+            // Cancelled via Ctrl+C
         } catch {
-            pane.writeTerminalText("Query failed: \(error.localizedDescription)\n")
+            if !Task.isCancelled {
+                pane.writeTerminalText("\r\n\u{1B}[31mQuery failed: \(error.localizedDescription)\u{1B}[0m\r\n")
+            }
         }
     }
 
     /// Answer query in chat mode (persistent context, uses separate chat model config)
     func answerChatQuery(_ input: String, for pane: TerminalPaneViewModel) async {
+        defer {
+            if !Task.isCancelled && pane.isChatModeActive {
+                pane.showChatPrompt(leadingNewline: false)
+            }
+        }
+
         // Use chat-specific provider/model if configured, otherwise fall back to default
         let provider: ModelProvider
         let modelID: String
@@ -1235,7 +1617,7 @@ final class AppModel: ObservableObject {
                     provider = fallbackProvider
                     modelID = fallbackModel
                 } else {
-                    pane.writeTerminalText("\nai> No provider or model configured for chat mode. Set up chat model in Settings.\n")
+                    pane.writeTerminalText("\u{1B}[33mai> No provider or model configured for chat mode. Set up a model in Settings (⌘,).\u{1B}[0m\r\n")
                     return
                 }
             }
@@ -1245,7 +1627,7 @@ final class AppModel: ObservableObject {
                 provider = fallbackProvider
                 modelID = fallbackModel
             } else {
-                pane.writeTerminalText("\nai> No provider or model configured for chat mode. Set up chat model in Settings.\n")
+                pane.writeTerminalText("\u{1B}[33mai> No provider or model configured for chat mode. Set up a model in Settings (⌘,).\u{1B}[0m\r\n")
                 return
             }
         }
@@ -1280,10 +1662,14 @@ final class AppModel: ObservableObject {
                 pane.chatConversationHistory.addAssistantMessage(trimmed)
             }
             pane.queryResponse = QueryResponseState()
+        } catch is CancellationError {
+            // Cancelled via Ctrl+C
         } catch {
-            let errorText = "Chat query failed: \(error.localizedDescription)"
-            pane.appendChatAssistantResponse(errorText)
-            pane.queryResponse = QueryResponseState()
+            if !Task.isCancelled {
+                let errorText = "Chat query failed: \(error.localizedDescription)"
+                pane.appendChatAssistantResponse(errorText)
+                pane.queryResponse = QueryResponseState()
+            }
         }
     }
 
@@ -1295,17 +1681,27 @@ final class AppModel: ObservableObject {
         pane: TerminalPaneViewModel
     ) async throws -> String {
         var accumulated = ""
+        var wroteHeader = false
+        pane.writeTerminalText("\u{1B}[90m✦ Thinking...\u{1B}[0m")
         let stream = try providerRouter.streamResponse(
             provider: provider,
             modelID: modelID,
             messages: conversationHistory.simplifiedMessages
         )
-        pane.writeTerminalText("ai> ")
         for try await chunk in stream {
+            if !wroteHeader {
+                pane.clearCurrentTerminalLine()
+                pane.writeTerminalText("\u{1B}[36;1mai>\u{1B}[0m ")
+                wroteHeader = true
+            }
             accumulated.append(chunk)
             pane.writeTerminalText(chunk)
         }
-        pane.writeTerminalText("\n")
+        if !wroteHeader {
+            pane.clearCurrentTerminalLine()
+            pane.writeTerminalText("\u{1B}[36;1mai>\u{1B}[0m ")
+        }
+        pane.writeTerminalText("\r\n")
         return accumulated
     }
 
@@ -1333,13 +1729,23 @@ final class AppModel: ObservableObject {
     ) async throws -> QueryResponseState {
         var queryResponse = initialResponse
         var fullText = ""
+        var wroteInlineHeader = false
         if useCard {
             queryResponse.isStreaming = true
             pane.queryResponse = queryResponse
+        } else {
+            pane.writeTerminalText("\u{1B}[90m✦ Thinking...\u{1B}[0m")
         }
 
         let toolSchemas = mcpHost.toolSchemas()
         let maxToolRoundTrips = 5
+
+        func ensureInlineHeaderWritten() {
+            guard !useCard && !wroteInlineHeader else { return }
+            pane.clearCurrentTerminalLine()
+            pane.writeTerminalText("\u{1B}[36;1mai>\u{1B}[0m ")
+            wroteInlineHeader = true
+        }
 
         func publishProgress() {
             if useCard {
@@ -1365,6 +1771,7 @@ final class AppModel: ObservableObject {
                     if useCard {
                         queryResponse.text.append(chunk)
                     } else {
+                        ensureInlineHeaderWritten()
                         fullText.append(chunk)
                         pane.writeTerminalText(chunk)
                     }
@@ -1385,6 +1792,7 @@ final class AppModel: ObservableObject {
                         if useCard {
                             queryResponse.text.append(chunk)
                         } else {
+                            ensureInlineHeaderWritten()
                             fullText.append(chunk)
                             pane.writeTerminalText(chunk)
                         }
@@ -1407,20 +1815,22 @@ final class AppModel: ObservableObject {
                 do {
                     let result = try await mcpHost.callTool(name: call.name, arguments: call.arguments)
                     toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: result))
-                    let note = "\n\n*[Used tool: \(call.name)]*\n"
+                    let note = "\n\u{1B}[90m[Used tool: \(call.name)]\u{1B}[0m\n"
                     if useCard {
-                        queryResponse.text.append(note)
+                        queryResponse.text.append("\n\n*[Used tool: \(call.name)]*\n")
                     } else {
+                        ensureInlineHeaderWritten()
                         pane.writeTerminalText(note)
                     }
                     publishProgress()
                 } catch {
                     let errorMsg = "Tool '\(call.name)' failed: \(error.localizedDescription)"
                     toolResults.append(ToolCallResult(toolCallID: call.id, name: call.name, content: errorMsg))
-                    let note = "\n\n*[\(errorMsg)]*\n"
+                    let note = "\n\u{1B}[33m[\(errorMsg)]\u{1B}[0m\n"
                     if useCard {
-                        queryResponse.text.append(note)
+                        queryResponse.text.append("\n\n*[\(errorMsg)]*\n")
                     } else {
+                        ensureInlineHeaderWritten()
                         pane.writeTerminalText(note)
                     }
                     publishProgress()
@@ -1443,7 +1853,11 @@ final class AppModel: ObservableObject {
             pane.queryResponse = queryResponse
             return queryResponse
         } else {
-            pane.writeTerminalText("\n")
+            if !wroteInlineHeader {
+                pane.clearCurrentTerminalLine()
+            } else {
+                pane.writeTerminalText("\r\n")
+            }
             if !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 conversationHistory.addAssistantMessage(fullText)
             }

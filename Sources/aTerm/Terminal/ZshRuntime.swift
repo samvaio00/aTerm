@@ -65,26 +65,41 @@ enum ZshRuntime {
         # aTerm runtime wrapper
         \(sourceLine)
 
-        emulate -L zsh
         autoload -Uz add-zsh-hook
 
         function aterm_emit_terminal_state() {
+          local exit_code=$?
+          emulate -L zsh
           local host_name path title
           host_name=${HOST:-localhost}
           path=${PWD// /%20}
           title=${PWD:t}
+          printf '\\033]133;D;%s\\a' "$exit_code"
           printf '\\033]7;file://%s%s\\a' "$host_name" "$path"
           printf '\\033]0;%s\\a' "$title"
+          printf '\\033]133;A\\a'
+          if [[ -o interactive ]] && [[ "${PS1:-}" != *133\\;B* ]]; then
+            PS1="${PS1}"$'%{\\033]133;B\\a%}'
+          fi
         }
 
-        add-zsh-hook precmd aterm_emit_terminal_state
-        add-zsh-hook chpwd aterm_emit_terminal_state
-        aterm_emit_terminal_state
+        function aterm_preexec() {
+          printf '\\033]133;C\\a'
+        }
 
-        # Invisible OSC 133 B after PS1 so aTerm knows where user input starts (smart line classification).
-        if [[ -o interactive ]] && [[ "${PS1:-}" != *133;B* ]]; then
-          PS1="${PS1}"$'%{\\033]133;B\\a%}'
+        function __aterm_zle_line_init() {
+          printf '\\033]133;B\\a'
+        }
+        if (( $+functions[zle] )) || [[ -o interactive ]]; then
+          zle -N zle-line-init __aterm_zle_line_init 2>/dev/null || true
+          bindkey -M emacs '^U' kill-whole-line 2>/dev/null || true
+          bindkey -M viins '^U' kill-whole-line 2>/dev/null || true
         fi
+
+        # Ensure aterm_emit_terminal_state runs first in precmd so 133;A precedes any theme precmd output
+        precmd_functions=(aterm_emit_terminal_state ${precmd_functions:#aterm_emit_terminal_state})
+        add-zsh-hook preexec aterm_preexec
+        aterm_emit_terminal_state
         """
     }
 }

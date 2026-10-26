@@ -20,6 +20,8 @@ enum AIRoutingMode: String, CaseIterable, Codable {
 struct ScrollbackSearchMatch: Equatable {
     let location: Int
     let length: Int
+    var line: Int = 0
+    var column: Int = 0
 }
 
 @MainActor
@@ -73,17 +75,28 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     private var outputTask: Task<Void, Never>?
     private var autoRestartTask: Task<Void, Never>?
     private var searchUpdateTask: Task<Void, Never>?
+    private var ptySuppressionFallbackTask: Task<Void, Never>?
+    var activeAITask: Task<Void, Never>?
     private lazy var vt100Parser: VT100Parser = VT100Parser(buffer: terminalBuffer)
     let conversationHistory = ConversationHistory()
     private var recentCommands: [String] = []
     private var lastOutputSnippet = ""
-    private var lastExitCode: Int32?
+    @Published private(set) var lastExitCode: Int32?
+    @Published private(set) var gitBranch: String?
     private var recentFailures: [String] = []
     private var chatInputBuffer = ""
     private var sessionStartTime: Date?
     private var projectInfo: ProjectContextDetector.ProjectInfo = ProjectContextDetector.ProjectInfo(type: .generic, gitBranch: nil, rootDirectory: nil)
     private let explicitLaunchConfiguration: PTYLaunchConfiguration?
     private let projectDetector = ProjectContextDetector.shared
+
+    private enum PTYOutputSuppressionMode {
+        case none
+        case suppressingLineClear
+        case untilNextPrompt
+        case untilCommandOutput
+    }
+    private var ptySuppressionMode: PTYOutputSuppressionMode = .none
 
     init(
         id: UUID = UUID(),
@@ -99,6 +112,11 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         title = initialTitle
         currentWorkingDirectory = workingDirectory
         preferredWorkingDirectory = workingDirectory
+        if let workingDirectory {
+            let detected = projectDetector.detectProjectInfo(for: workingDirectory)
+            projectInfo = detected
+            gitBranch = detected.gitBranch
+        }
         appearance = profile.appearance
         profileID = profile.id
         profileName = profile.name
@@ -113,6 +131,18 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     var isAgentTab: Bool {
         if case .agent = kind { return true }
         return false
+    }
+
+    var abbreviatedWorkingDirectory: String? {
+        guard let path = currentWorkingDirectory?.path, !path.isEmpty else { return nil }
+        let home = NSHomeDirectory()
+        if path == home {
+            return "~"
+        }
+        if path.hasPrefix(home + "/") {
+            return "~" + String(path.dropFirst(home.count))
+        }
+        return path
     }
 
     var searchMatches: [ScrollbackSearchMatch] {
@@ -147,8 +177,20 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             return
         }
 
-        // Return on the main screen: classify the visible line (zsh already holds the same text in readline).
-        if !isChatModeActive, !isAgentTab, !terminalBuffer.isAlternateScreen,
+        // Ctrl+C (0x03): cancel active AI generation/streaming if running
+        if data == Data([0x03]), activeAITask != nil {
+            cancelActiveAITask()
+            return
+        }
+
+        // In-terminal Chat Mode input handling
+        if isChatModeActive {
+            handleChatModeInput(data)
+            return
+        }
+
+        // Return on the main shell prompt: route through smart classification
+        if !isAgentTab, !terminalBuffer.isAlternateScreen, terminalBuffer.isAtShellPrompt,
            let onSubmitSmartLine,
            data == Data([0x0d]) || data == Data([0x0a]) {
             let userLine = terminalBuffer.userInputForSmartClassification()
@@ -164,61 +206,6 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
             return
         }
 
-        // Check for chat command interception
-        if let text = String(data: data, encoding: .utf8) {
-            if isChatModeActive {
-                // In chat mode, collect a full line and only send to AI on Enter.
-                if text == "\r" || text == "\n" || text == "\r\n" {
-                    let message = chatInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                    appendChatLine("")
-                    chatInputBuffer = ""
-                    if message.lowercased() == "/chat-exit" || message.lowercased() == "/chatexit" || message.lowercased() == "/chat-eixt" {
-                        exitChatMode()
-                        return
-                    }
-                    if !message.isEmpty {
-                        onChatRequest?(message)
-                    } else {
-                        showChatPrompt()
-                    }
-                    return
-                }
-
-                // Handle backspace/delete in local chat line buffer.
-                if text == "\u{7f}" || text == "\u{8}" {
-                    if !chatInputBuffer.isEmpty {
-                        chatInputBuffer.removeLast()
-                        eraseLastChatInputCharacter()
-                    }
-                    return
-                }
-
-                // Ignore escape and other control characters while building the chat line.
-                if text.unicodeScalars.allSatisfy({ $0.value < 0x20 || $0.value == 0x7f }) {
-                    return
-                }
-
-                chatInputBuffer.append(text)
-                appendChatInputCharacters(text)
-                return
-            }
-
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chatexit" || trimmed.lowercased() == "/chat-eixt" {
-                exitChatMode()
-                return
-            }
-            if trimmed.lowercased().hasPrefix("/chat ") || trimmed.lowercased() == "/chat" {
-                let chatContent = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
-                enterChatMode(providerID: appearance.chatProvider, modelID: appearance.chatModel)
-                if !chatContent.isEmpty {
-                    // Process the chat message via callback
-                    onChatRequest?(chatContent)
-                }
-                return
-            }
-        }
-
         if session.isRunning {
             Log.debug("input", "handleInput: sending \(data.count) bytes to PTY")
             session.send(data)
@@ -227,6 +214,111 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
 
         Log.debug("input", "handleInput: session not running, attempting restart")
         restartSessionIfPossible()
+    }
+
+    private func handleChatModeInput(_ data: Data) {
+        // Ctrl+C in chat mode: clear current input or exit chat mode if empty
+        if data == Data([0x03]) {
+            if !chatInputBuffer.isEmpty {
+                chatInputBuffer = ""
+                writeTerminalText("^C\r\n")
+                showChatPrompt(leadingNewline: false)
+            } else {
+                writeTerminalText("^C")
+                exitChatMode()
+            }
+            return
+        }
+
+        // Ctrl+D in chat mode: exit if input buffer is empty
+        if data == Data([0x04]), chatInputBuffer.isEmpty {
+            exitChatMode()
+            return
+        }
+
+        // Ctrl+U in chat mode: kill current input line
+        if data == Data([0x15]) {
+            while !chatInputBuffer.isEmpty {
+                chatInputBuffer.removeLast()
+                eraseLastChatInputCharacter()
+            }
+            return
+        }
+
+        // Ctrl+W in chat mode: delete last word
+        if data == Data([0x17]) {
+            while chatInputBuffer.last?.isWhitespace == true {
+                chatInputBuffer.removeLast()
+                eraseLastChatInputCharacter()
+            }
+            while let last = chatInputBuffer.last, !last.isWhitespace {
+                chatInputBuffer.removeLast()
+                eraseLastChatInputCharacter()
+            }
+            return
+        }
+
+        guard var text = String(data: data, encoding: .utf8) else { return }
+        // Strip bracketed paste wrappers if present
+        text = text
+            .replacingOccurrences(of: "\u{1b}[200~", with: "")
+            .replacingOccurrences(of: "\u{1b}[201~", with: "")
+
+        if text == "\r" || text == "\n" || text == "\r\n" {
+            let message = chatInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            chatInputBuffer = ""
+            writeTerminalText("\r\n")
+            let lower = message.lowercased()
+            if ["/chat-exit", "/chatexit", "/chat-eixt", "/exit", "/quit", "/q", "exit", "quit"].contains(lower) {
+                exitChatMode(leadingNewline: false)
+                return
+            }
+            if lower == "/clear" {
+                chatConversationHistory.clear()
+                clearScrollback()
+                showChatPrompt(leadingNewline: false)
+                return
+            }
+            if !message.isEmpty {
+                onChatRequest?(message)
+            } else {
+                showChatPrompt(leadingNewline: false)
+            }
+            return
+        }
+
+        // Handle backspace/delete in local chat line buffer
+        if text == "\u{7f}" || text == "\u{8}" {
+            if !chatInputBuffer.isEmpty {
+                chatInputBuffer.removeLast()
+                eraseLastChatInputCharacter()
+            }
+            return
+        }
+
+        // Ignore escape and other control characters while building the chat line
+        if text.unicodeScalars.allSatisfy({ $0.value < 0x20 || $0.value == 0x7f }) {
+            return
+        }
+
+        // Flatten multi-line paste in chat prompt to single spaces
+        let printable = text.replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        chatInputBuffer.append(printable)
+        appendChatInputCharacters(printable)
+    }
+
+    func cancelActiveAITask() {
+        activeAITask?.cancel()
+        activeAITask = nil
+        clearAssistantState()
+        writeTerminalText("\u{1B}[90m^C\u{1B}[0m\r\n")
+        if isChatModeActive {
+            showChatPrompt(leadingNewline: false)
+        } else {
+            finishInlineAIOutput()
+        }
     }
 
     func updateTerminalSize(columns: UInt16, rows: UInt16) {
@@ -298,25 +390,117 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     }
 
     /// Submit a line zsh already has buffered (user typed at the prompt; we withheld Return).
-    func sendBufferedReturnToShell() {
+    func sendBufferedReturnToShell(commandForHistory: String? = nil) {
+        if let commandForHistory {
+            recordTerminalCommand(commandForHistory)
+        }
         guard let session, session.isRunning else { return }
         session.send(Data([0x0d]))
     }
 
-    /// Emacs-style kill line (zsh default); clears a line the user typed when we handle it in-app instead.
+    /// Moves to end of line (`^E`) and kills the whole line (`^U`) so zsh ZLE discards any buffered input regardless of cursor position or Oh My Zsh bindings.
     func sendShellKillLineToPTY() {
         guard let session, session.isRunning else { return }
-        session.send(Data([0x15]))
+        session.send(Data([0x05, 0x15]))
     }
 
-    /// Write arbitrary text directly into the terminal buffer (natural terminal output).
-    func writeTerminalText(_ text: String) {
-        terminalBuffer.resetCurrentAttributesToDefault()
-        for ch in text {
-            if ch == "\r" { terminalBuffer.carriageReturn() }
-            else if ch == "\n" { terminalBuffer.lineFeed() }
-            else { terminalBuffer.putChar(ch) }
+    /// Prepares the terminal for inline AI output without erasing the user's typed line from the screen.
+    /// Silently clears zsh's pending readline buffer (`^E^U` with PTY echo suppressed) and moves the terminal cursor to a new line.
+    func prepareForInlineAIOutput(lineAlreadyBufferedInShell: Bool) {
+        ptySuppressionFallbackTask?.cancel()
+        if lineAlreadyBufferedInShell {
+            ptySuppressionMode = .suppressingLineClear
+            sendShellKillLineToPTY()
+            schedulePTYSuppressionFallback(nanoseconds: 100_000_000)
+        } else {
+            ptySuppressionMode = .none
         }
+        writeTerminalText("\u{1B}[0m\r\n")
+    }
+
+    /// Completes inline AI output by ensuring the cursor is on a fresh line and asking zsh to draw a fresh prompt.
+    func finishInlineAIOutput() {
+        if terminalBuffer.cursorX > 0 {
+            writeTerminalText("\u{1B}[0m\r\n")
+        } else {
+            writeTerminalText("\u{1B}[0m")
+        }
+        terminalBuffer.markPromptStart()
+        modeIndicatorText = isAgentTab ? "AGENT" : InputMode.terminal.rawValue
+        guard let session, session.isRunning else {
+            ptySuppressionMode = .none
+            return
+        }
+        ptySuppressionMode = .untilNextPrompt
+        session.send(Data([0x0d]))
+        schedulePTYSuppressionFallback(nanoseconds: 250_000_000)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, let self,
+                  !self.isChatModeActive,
+                  self.activeAITask == nil,
+                  let session = self.session, session.isRunning else { return }
+            if self.terminalBuffer.cursorX == 0 && self.terminalBuffer.shellInputStartColumn == nil {
+                self.ptySuppressionMode = .none
+                session.send(Data([0x0d]))
+            }
+        }
+    }
+
+    /// Displays an AI-generated shell command inline and executes it in the active shell session without duplicate echoing.
+    func executeGeneratedShellCommand(_ command: String) {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            finishInlineAIOutput()
+            return
+        }
+        recordTerminalCommand(trimmed)
+        writeTerminalText("\u{1B}[33m⚡\u{1B}[0m \u{1B}[1m\(trimmed)\u{1B}[0m\r\n")
+        guard let session, session.isRunning else {
+            ptySuppressionMode = .none
+            return
+        }
+        ptySuppressionMode = .untilCommandOutput
+        session.send(Data((trimmed + "\r").utf8))
+        schedulePTYSuppressionFallback(nanoseconds: 250_000_000)
+        modeIndicatorText = isAgentTab ? "AGENT" : InputMode.terminal.rawValue
+    }
+
+    /// Requests a fresh prompt from the shell and pre-fills `command` into zsh's line editor without executing it.
+    func prefillShellPrompt(with command: String) {
+        finishInlineAIOutput()
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard let self, let session = self.session, session.isRunning else { return }
+            self.ptySuppressionMode = .none
+            session.send(Data(trimmed.utf8))
+        }
+    }
+
+    private func schedulePTYSuppressionFallback(nanoseconds: UInt64) {
+        ptySuppressionFallbackTask?.cancel()
+        ptySuppressionFallbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled, let self else { return }
+            self.ptySuppressionMode = .none
+        }
+    }
+
+    /// Write arbitrary text (with optional ANSI sequences) directly into the terminal buffer via the VT100 parser.
+    func writeTerminalText(_ text: String) {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: "\r\n")
+        vt100Parser.feed(Data(normalized.utf8))
+        lastOutputSnippet = terminalBuffer.lastScreenLine(maxChars: 120)
+        bufferVersion &+= 1
+    }
+
+    /// Clears the current terminal row and moves the cursor to column 0 (used to replace inline status indicators like "Thinking...").
+    func clearCurrentTerminalLine() {
+        vt100Parser.feed(Data("\r\u{1B}[2K".utf8))
         bufferVersion &+= 1
     }
 
@@ -334,33 +518,27 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
     
     // MARK: - Chat Mode
     
-    func enterChatMode(providerID: String?, modelID: String?) {
+    func enterChatMode(providerID: String?, modelID: String?, showInitialPrompt: Bool = true) {
         isChatModeActive = true
         chatProviderID = providerID
         chatModelID = modelID
         chatInputBuffer = ""
         modeIndicatorText = "CHAT"
         chatConversationHistory.clear()
-        appendChatLine("[chat mode enabled: type a message and press Enter, /chat-exit to leave]")
-        showChatPrompt()
+        writeTerminalText("\u{1B}[36m[Chat mode active — type a message, /clear to reset, or /exit (Ctrl+C) to return to shell]\u{1B}[0m\r\n")
+        if showInitialPrompt {
+            showChatPrompt(leadingNewline: false)
+        }
     }
     
-    func exitChatMode() {
+    func exitChatMode(leadingNewline: Bool = true) {
         isChatModeActive = false
         chatInputBuffer = ""
         modeIndicatorText = isAgentTab ? "AGENT" : InputMode.terminal.rawValue
-        // Clear conversation history when exiting chat mode
         chatConversationHistory.clear()
-        appendChatLine("[chat mode disabled: back to terminal]")
-        syncShellLineAfterChatExit()
-    }
-
-    /// `/chat` and `/chat-exit` are handled locally, so the shell never receives Enter; clear the
-    /// pending line and submit an empty line so zsh redraws a normal prompt.
-    private func syncShellLineAfterChatExit() {
-        guard let session, session.isRunning else { return }
-        session.send(Data([0x15])) // Ctrl+U — kill line (zsh emacs default)
-        session.send(Data("\r".utf8))
+        let prefix = leadingNewline ? "\r\n" : ""
+        writeTerminalText("\(prefix)\u{1B}[90m[Exited chat mode]\u{1B}[0m\r\n")
+        finishInlineAIOutput()
     }
 
     func clearScrollback() {
@@ -456,7 +634,23 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
                     guard let self else { return }
                     switch event {
                     case let .output(data):
-                        self.vt100Parser.feed(data)
+                        let filteredData = self.filterSuppressedPTYOutput(data)
+                        guard !filteredData.isEmpty else { continue }
+                        self.vt100Parser.feed(filteredData)
+                        if let cmdExit = self.terminalBuffer.lastCommandExitCode {
+                            let code = Int32(cmdExit)
+                            if self.lastExitCode != code {
+                                self.lastExitCode = code
+                                if code != 0, let lastCmd = self.recentCommands.last {
+                                    if self.recentFailures.last != lastCmd {
+                                        self.recentFailures.append(lastCmd)
+                                        if self.recentFailures.count > 10 {
+                                            self.recentFailures.removeFirst(self.recentFailures.count - 10)
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         TerminalKeyMapper.applicationCursorKeys = self.terminalBuffer.applicationCursorKeys
                         self.isAlternateScreen = self.terminalBuffer.isAlternateScreen
                         if self.terminalBuffer.bellFired {
@@ -471,10 +665,15 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
                             if workingDirectory != self.currentWorkingDirectory {
                                 self.currentWorkingDirectory = workingDirectory
                                 self.preferredWorkingDirectory = workingDirectory
+                                self.projectInfo = self.projectDetector.detectProjectInfo(for: workingDirectory)
+                                self.gitBranch = self.projectInfo.gitBranch
                                 if !self.isAgentTab {
                                     self.title = workingDirectory.lastPathComponent.isEmpty ? "/" : workingDirectory.lastPathComponent
                                 }
                                 self.stateDidChange?()
+                            } else if self.gitBranch == nil {
+                                self.projectInfo = self.projectDetector.detectProjectInfo(for: workingDirectory)
+                                self.gitBranch = self.projectInfo.gitBranch
                             }
                         }
                         if let title = self.terminalBuffer.title, !title.isEmpty, !self.isAgentTab {
@@ -560,24 +759,30 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return SearchResult(matches: []) }
 
-        let nsText = text as NSString
-        let range = NSRange(location: 0, length: nsText.length)
-
-        if isRegex {
-            guard let regex = try? NSRegularExpression(pattern: trimmed, options: []) else {
-                return SearchResult(matches: [])
-            }
-            let matches = regex.matches(in: text, options: [], range: range)
-                .map { ScrollbackSearchMatch(location: $0.range.location, length: $0.range.length) }
-            return SearchResult(matches: matches)
-        }
-
-        let escaped = NSRegularExpression.escapedPattern(for: trimmed)
-        guard let regex = try? NSRegularExpression(pattern: escaped, options: []) else {
+        let pattern = isRegex ? trimmed : NSRegularExpression.escapedPattern(for: trimmed)
+        let options: NSRegularExpression.Options = isRegex ? [] : [.caseInsensitive]
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else {
             return SearchResult(matches: [])
         }
-        let matches = regex.matches(in: text, options: [], range: range)
-            .map { ScrollbackSearchMatch(location: $0.range.location, length: $0.range.length) }
+
+        let lines = text.components(separatedBy: "\n")
+        var matches: [ScrollbackSearchMatch] = []
+        var offset = 0
+        for (lineIdx, lineStr) in lines.enumerated() {
+            let nsLine = lineStr as NSString
+            let lineRange = NSRange(location: 0, length: nsLine.length)
+            for match in regex.matches(in: lineStr, options: [], range: lineRange) where match.range.length > 0 {
+                matches.append(
+                    ScrollbackSearchMatch(
+                        location: offset + match.range.location,
+                        length: match.range.length,
+                        line: lineIdx,
+                        column: match.range.location
+                    )
+                )
+            }
+            offset += nsLine.length + 1
+        }
         return SearchResult(matches: matches)
     }
 
@@ -587,25 +792,63 @@ final class TerminalPaneViewModel: ObservableObject, Identifiable {
 
     private var searchResult = SearchResult(matches: [])
 
-    /// Move to the start of the next row, then write `text` (LF before CR so we never repaint from column 0 on the same row).
-    private func appendChatLine(_ text: String) {
-        terminalBuffer.resetCurrentAttributesToDefault()
-        terminalBuffer.lineFeed()
-        terminalBuffer.carriageReturn()
-        for ch in text {
-            terminalBuffer.putChar(ch)
+    private static let osc133PromptStartMarker = Data("\u{1B}]133;A".utf8)
+    private static let osc133CommandDoneMarker = Data("\u{1B}]133;D".utf8)
+    private static let osc133CommandStartMarker = Data("\u{1B}]133;C".utf8)
+
+    private func filterSuppressedPTYOutput(_ data: Data) -> Data {
+        switch ptySuppressionMode {
+        case .none:
+            return data
+        case .suppressingLineClear:
+            // Suppress ZLE's non-newline echo of ^E^U; stop immediately if a prompt marker or newline arrives.
+            let rangeD = data.range(of: Self.osc133CommandDoneMarker)
+            let rangeA = data.range(of: Self.osc133PromptStartMarker)
+            let afterNewline = data.firstIndex(of: 0x0a).map { data.index(after: $0) }
+            let earliestStart = [rangeD?.lowerBound, rangeA?.lowerBound, afterNewline].compactMap { $0 }.min()
+            if let start = earliestStart {
+                ptySuppressionFallbackTask?.cancel()
+                ptySuppressionMode = .none
+                return Data(data[start...])
+            }
+            return Data()
+        case .untilNextPrompt:
+            // Stop at OSC 133;D / 133;A OR immediately after the echoed \r\n (0x0a) of the empty Return
+            // so the prompt is never swallowed even if OSC 133 is split across chunks or absent.
+            let rangeD = data.range(of: Self.osc133CommandDoneMarker)
+            let rangeA = data.range(of: Self.osc133PromptStartMarker)
+            let afterNewline = data.firstIndex(of: 0x0a).map { data.index(after: $0) }
+            let earliestStart = [rangeD?.lowerBound, rangeA?.lowerBound, afterNewline].compactMap { $0 }.min()
+            if let start = earliestStart {
+                ptySuppressionFallbackTask?.cancel()
+                ptySuppressionMode = .none
+                return Data(data[start...])
+            }
+            return Data()
+        case .untilCommandOutput:
+            // Stop at OSC 133;C / 133;D / 133;A OR immediately after ZLE echoes the command + \r\n (0x0a).
+            let rangeC = data.range(of: Self.osc133CommandStartMarker)
+            let rangeD = data.range(of: Self.osc133CommandDoneMarker)
+            let rangeA = data.range(of: Self.osc133PromptStartMarker)
+            let afterNewline = data.firstIndex(of: 0x0a).map { data.index(after: $0) }
+            let earliestStart = [rangeC?.lowerBound, rangeD?.lowerBound, rangeA?.lowerBound, afterNewline].compactMap { $0 }.min()
+            if let start = earliestStart {
+                ptySuppressionFallbackTask?.cancel()
+                ptySuppressionMode = .none
+                return Data(data[start...])
+            }
+            return Data()
         }
-        bufferVersion &+= 1
     }
 
-    private func showChatPrompt() {
-        terminalBuffer.resetCurrentAttributesToDefault()
-        terminalBuffer.lineFeed()
-        terminalBuffer.carriageReturn()
-        for ch in "chat> " {
-            terminalBuffer.putChar(ch)
-        }
-        bufferVersion &+= 1
+    func showChatPrompt(leadingNewline: Bool = true) {
+        let prefix = leadingNewline && terminalBuffer.cursorX > 0 ? "\r\n" : ""
+        writeTerminalText("\(prefix)\u{1B}[36;1mchat>\u{1B}[0m ")
+    }
+
+    private func appendChatLine(_ text: String) {
+        let prefix = terminalBuffer.cursorX > 0 ? "\r\n" : ""
+        writeTerminalText("\(prefix)\(text)\r\n")
     }
 
     private func appendChatInputCharacters(_ text: String) {

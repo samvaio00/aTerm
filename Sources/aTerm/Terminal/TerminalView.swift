@@ -39,6 +39,7 @@ struct TerminalView: NSViewControllerRepresentable {
         root.applyAppearance(appearance, theme: theme)
         _ = bufferVersion
         root.updateBuffer(buffer)
+        root.updateSearch(matches: searchMatches, currentIndex: currentSearchIndex)
         context.coordinator.onChatExit = onChatExit
         context.coordinator.onChatEnter = onChatEnter
         let alt = buffer.isAlternateScreen
@@ -281,21 +282,42 @@ final class TerminalContainerView: NSView {
         gridView.buffer = buffer
         gridView.needsDisplay = true
 
+        // Decide follow-tail using the previous document height BEFORE resizing `gridView.frame`
+        // so multi-line outputs (e.g. inline AI responses or /help) don't falsely appear "scrolled up".
+        let oldDocHeight = gridView.frame.height
+        let shouldFollowTail = isScrolledNearBottom(documentHeight: oldDocHeight)
+
         let totalLines = buffer.totalLineCount
         let lineHeight = gridView.cellHeight
         // Add extra padding at bottom so cursor/prompt isn't hidden at edge
-        let bottomPadding: CGFloat = 8
-        let docHeight = max(CGFloat(totalLines) * lineHeight + bottomPadding, scrollView.contentView.bounds.height)
+        let topPad = max(appliedAppearance.padding.top, 6)
+        let bottomPad = max(appliedAppearance.padding.bottom, 10)
+        let docHeight = max(CGFloat(totalLines) * lineHeight + topPad + bottomPad, scrollView.contentView.bounds.height)
         let docWidth = max(scrollView.contentView.bounds.width, 1)
         gridView.frame = NSRect(x: 0, y: 0, width: docWidth, height: docHeight)
 
-        // Decide follow-tail using the *actual* visible rect in document space. The old check
-        // compared doc height to clip height only, so it almost never scrolled — the prompt
-        // stayed on the last row below the viewport (blank black terminal).
-        let shouldFollowTail = isScrolledNearBottom(documentHeight: docHeight)
         if shouldFollowTail, scrollView.contentView.bounds.height > 1 {
             let clipH = scrollView.contentView.bounds.height
             let targetY = max(0, docHeight - clipH)
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
+    func updateSearch(matches: [ScrollbackSearchMatch], currentIndex: Int) {
+        let changed = gridView.searchMatches != matches || gridView.currentSearchIndex != currentIndex
+        guard changed else { return }
+        gridView.searchMatches = matches
+        gridView.currentSearchIndex = currentIndex
+        gridView.needsDisplay = true
+
+        if currentIndex >= 0, currentIndex < matches.count, gridView.cellHeight > 0 {
+            let match = matches[currentIndex]
+            let topPad = max(appliedAppearance.padding.top, 6)
+            let matchY = CGFloat(match.line) * gridView.cellHeight + topPad
+            let clipH = scrollView.contentView.bounds.height
+            let maxY = max(0, gridView.frame.height - clipH)
+            let targetY = min(max(0, matchY - clipH * 0.4), maxY)
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
             scrollView.reflectScrolledClipView(scrollView.contentView)
         }
@@ -305,8 +327,8 @@ final class TerminalContainerView: NSView {
         let cw = gridView.cellWidth
         let ch = gridView.cellHeight
         guard cw > 0, ch > 0 else { return }
-        let horizontalInset = appliedAppearance.padding.left + appliedAppearance.padding.right
-        let verticalInset = appliedAppearance.padding.top + appliedAppearance.padding.bottom
+        let horizontalInset = max(appliedAppearance.padding.left, 10) + max(appliedAppearance.padding.right, 10)
+        let verticalInset = max(appliedAppearance.padding.top, 6) + max(appliedAppearance.padding.bottom, 6)
         let columns = max(20, Int((bounds.width - horizontalInset) / cw))
         let rows = max(5, Int((bounds.height - verticalInset) / ch))
         handler?.resize(columns: UInt16(columns), rows: UInt16(rows))
@@ -348,13 +370,13 @@ final class TerminalGridView: NSView {
     private var isDragging = false
     private var clickCount = 0
 
+    // Search highlight state
+    var searchMatches: [ScrollbackSearchMatch] = []
+    var currentSearchIndex: Int = 0
+
     // Cursor blink state
     private var cursorBlinkVisible = true
     private var cursorBlinkTimer: Timer?
-    
-    // Local line buffer for intercepting /chat commands
-    private var localLineBuffer = ""
-    private var isLocalBufferActive = false
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
@@ -400,8 +422,8 @@ final class TerminalGridView: NSView {
     // MARK: - Grid Position from Point
 
     private func gridPosition(for point: NSPoint) -> TerminalPosition {
-        let paddingLeft = termAppearance.padding.left
-        let paddingTop = termAppearance.padding.top
+        let paddingLeft = max(termAppearance.padding.left, 10)
+        let paddingTop = max(termAppearance.padding.top, 6)
         let col = max(0, Int((point.x - paddingLeft) / cellWidth))
         let line = max(0, Int((point.y - paddingTop) / cellHeight))
         return TerminalPosition(line: line, col: col)
@@ -454,8 +476,8 @@ final class TerminalGridView: NSView {
         ctx.setFillColor(bgColor)
         ctx.fill(dirtyRect)
 
-        let paddingLeft = termAppearance.padding.left
-        let paddingTop = termAppearance.padding.top
+        let paddingLeft = max(termAppearance.padding.left, 10)
+        let paddingTop = max(termAppearance.padding.top, 6)
 
         let scrollbackLines = buffer.scrollback
         let totalScrollback = scrollbackLines.count
@@ -474,9 +496,14 @@ final class TerminalGridView: NSView {
 
         guard firstVisibleLine <= lastVisibleLine else { return }
 
+        let activeMatch: ScrollbackSearchMatch? = (currentSearchIndex >= 0 && currentSearchIndex < searchMatches.count)
+            ? searchMatches[currentSearchIndex]
+            : nil
+
         for lineIndex in firstVisibleLine...lastVisibleLine {
             let y = CGFloat(lineIndex) * cellHeight + paddingTop
             let cells: [TerminalCell]
+            let lineMatches = searchMatches.isEmpty ? [] : searchMatches.filter { $0.line == lineIndex }
 
             if lineIndex < totalScrollback {
                 guard lineIndex < scrollbackLines.count else { continue }
@@ -506,6 +533,20 @@ final class TerminalGridView: NSView {
                 if bgSpec != .default {
                     ctx.setFillColor(bgColorResolved.nsColor.cgColor)
                     ctx.fill(cellRect)
+                }
+
+                // Search match highlight
+                if !lineMatches.isEmpty {
+                    let isActiveMatchCell = activeMatch.map {
+                        $0.line == lineIndex && col >= $0.column && col < ($0.column + $0.length)
+                    } ?? false
+                    if isActiveMatchCell {
+                        ctx.setFillColor(NSColor.systemOrange.withAlphaComponent(0.6).cgColor)
+                        ctx.fill(cellRect)
+                    } else if lineMatches.contains(where: { col >= $0.column && col < ($0.column + $0.length) }) {
+                        ctx.setFillColor(NSColor.systemYellow.withAlphaComponent(0.3).cgColor)
+                        ctx.fill(cellRect)
+                    }
                 }
 
                 // Selection highlight
@@ -638,49 +679,7 @@ final class TerminalGridView: NSView {
             needsDisplay = true
         }
 
-        // Handle chat command interception
         if let data = TerminalKeyMapper.data(for: event) {
-            // Check for Return key (keyCode 36)
-            if event.keyCode == 36 {
-                // Check if local buffer starts with /chat command
-                let trimmed = localLineBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chatexit" || trimmed.lowercased() == "/chat-eixt" {
-                    localLineBuffer = ""
-                    inputHandler?.sendChatExit()
-                    return
-                }
-                if trimmed.lowercased().hasPrefix("/chat ") || trimmed.lowercased() == "/chat" {
-                    let chatContent = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    localLineBuffer = ""
-                    inputHandler?.sendChatEnter(content: chatContent)
-                    return
-                }
-                // Not a chat command, send normally and clear buffer
-                localLineBuffer = ""
-                inputHandler?.send(bytes: data)
-                return
-            }
-            
-            // Handle backspace/delete (keyCode 51)
-            if event.keyCode == 51 {
-                if !localLineBuffer.isEmpty {
-                    localLineBuffer.removeLast()
-                }
-                inputHandler?.send(bytes: data)
-                return
-            }
-            
-            // Handle escape (keyCode 53) - clear buffer
-            if event.keyCode == 53 {
-                localLineBuffer = ""
-                inputHandler?.send(bytes: data)
-                return
-            }
-            
-            // Regular character - add to buffer and send
-            if let chars = event.characters {
-                localLineBuffer.append(chars)
-            }
             inputHandler?.send(bytes: data)
             return
         }
@@ -977,7 +976,7 @@ enum TerminalKeyMapper {
         let arrowPrefix = applicationCursorKeys ? "\u{1b}O" : "\u{1b}["
 
         switch Int(event.keyCode) {
-        case 36: return Data("\r".utf8)
+        case 36, 76: return Data("\r".utf8)
         case 48: return shift ? Data("\u{1b}[Z".utf8) : Data("\t".utf8)
         case 51: return ctrl ? Data([0x08]) : Data([0x7f])
         case 117: return Data("\u{1b}[3~".utf8)

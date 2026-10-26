@@ -2,9 +2,20 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct AppearanceSidebarView: View {
+    private enum SidebarSection: String, CaseIterable, Identifiable {
+        case appearance = "Appearance"
+        case ai = "AI"
+        case tools = "Tools"
+        case help = "Help"
+
+        var id: String { rawValue }
+    }
+
     @EnvironmentObject private var appModel: AppModel
     @EnvironmentObject private var windowModel: WindowModel
     @ObservedObject var tab: TerminalTabViewModel
+    var onClose: (() -> Void)? = nil
+    @State private var selectedSection: SidebarSection = .appearance
     @State private var isImportingTheme = false
     @State private var isCatalogPresented = false
     @State private var newProfileName = ""
@@ -21,18 +32,69 @@ struct AppearanceSidebarView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                profileSection
-                themeSection
-                providerSection
-                agentSection
-                mcpSection
-                fontSection
-                layoutSection
-                environmentSection
+        VStack(spacing: 0) {
+            // Sidebar Header & Segmented Picker
+            VStack(spacing: 10) {
+                HStack {
+                    Label("Workspace Settings", systemImage: "slider.horizontal.3")
+                        .font(DesignSystem.Typography.defaultFont(13, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    if let onClose {
+                        Button {
+                            onClose()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 22, height: 22)
+                                .background(Circle().fill(Color.white.opacity(0.06)))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Close Sidebar")
+                    }
+                }
+
+                Picker("", selection: $selectedSection) {
+                    ForEach(SidebarSection.allCases) { section in
+                        Text(section.rawValue).tag(section)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+            .background(Color.white.opacity(0.02))
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    switch selectedSection {
+                    case .appearance:
+                        profileSection
+                        Divider().opacity(0.4)
+                        themeSection
+                        Divider().opacity(0.4)
+                        fontSection
+                        Divider().opacity(0.4)
+                        layoutSection
+                    case .ai:
+                        providerSection
+                    case .tools:
+                        agentSection
+                        Divider().opacity(0.4)
+                        mcpSection
+                        Divider().opacity(0.4)
+                        environmentSection
+                    case .help:
+                        SidebarHelpSectionView(tab: tab)
+                    }
+                }
+                .padding(16)
+            }
         }
         .frame(minWidth: 320, idealWidth: 340, maxWidth: 360)
         .fileImporter(isPresented: $isImportingTheme, allowedContentTypes: [.xml, .data]) { result in

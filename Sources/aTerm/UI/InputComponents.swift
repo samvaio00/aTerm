@@ -280,15 +280,27 @@ struct ModernDisambiguationBar: View {
                     .font(DesignSystem.Typography.defaultFont(12, weight: .medium))
             }
             
+            Text(input)
+                .font(DesignSystem.Typography.mono(11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+            
             Spacer()
             
             HStack(spacing: DesignSystem.Spacing.s) {
-                Button("Shell Command") {
+                Button("Run in Shell") {
                     windowModel.resolveDisambiguation(as: .terminal, for: pane)
                 }
                 .buttonStyle(ModernButtonStyle(variant: .secondary, size: .s))
                 
-                Button("AI Query") {
+                Button("Ask AI") {
                     windowModel.resolveDisambiguation(as: .query, for: pane)
                 }
                 .buttonStyle(ModernButtonStyle(variant: .secondary, size: .s))
@@ -297,27 +309,31 @@ struct ModernDisambiguationBar: View {
                     windowModel.resolveDisambiguation(as: .aiToShell, for: pane)
                 }
                 .buttonStyle(ModernButtonStyle(variant: .primary, size: .s))
+                
+                Button {
+                    pane.clearAssistantState()
+                    pane.finishInlineAIOutput()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(4)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel")
             }
-            
-            Divider()
-                .frame(height: 20)
-            
-            Text(input)
-                .font(DesignSystem.Typography.mono(11))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: 150, alignment: .trailing)
         }
         .padding(.horizontal, DesignSystem.Spacing.m)
         .padding(.vertical, 10)
         .background(
-            RoundedRectangle(cornerRadius: 0)
+            RoundedRectangle(cornerRadius: DesignSystem.Radius.m, style: .continuous)
                 .fill(.regularMaterial)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 0)
-                        .strokeBorder(Color.orange.opacity(0.2), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: DesignSystem.Radius.m, style: .continuous)
+                        .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
                 )
         )
+        .padding(.horizontal, DesignSystem.Spacing.m)
+        .padding(.bottom, DesignSystem.Spacing.s)
     }
 }

@@ -60,15 +60,14 @@ final class InputClassifier {
     ]
     
     // MARK: - Classification
-    
-    /// Classifies user input with confidence scoring and explanation
-    func classify(
+
+    /// Synchronously pre-parses user input to immediately distinguish shell commands from AI requests without any LLM latency.
+    /// Returns a `ClassificationResult` when heuristics/syntax/command resolution are decisive, or `nil` when truly ambiguous.
+    func fastClassify(
         _ input: String,
         context: ClassificationContext,
-        provider: ModelProvider?,
-        modelID: String?
-    ) async throws -> ClassificationResult? {
-        
+        routingMode: AIRoutingMode = .smart
+    ) -> ClassificationResult? {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return ClassificationResult(
@@ -84,7 +83,7 @@ final class InputClassifier {
                 )
             )
         }
-        
+
         // 0. Check for /chat command - forces pure AI chat mode
         if isChatCommand(trimmed) {
             return ClassificationResult(
@@ -100,13 +99,29 @@ final class InputClassifier {
                 )
             )
         }
-        
-        // 1. Check for forced mode prefixes
+
+        // 1. Check for forced mode prefixes (?, ??, !, >, $, /ask, /cmd)
         if let forced = forcedMode(for: trimmed) {
             return createForcedResult(for: forced, input: trimmed)
         }
-        
-        // 2. Check for learned patterns from user feedback
+
+        // 2. In Shell-only routing mode, all unprefixed input goes straight to zsh
+        if routingMode == .shell {
+            return ClassificationResult(
+                mode: .terminal,
+                confidence: .certain,
+                score: 1.0,
+                explanation: ClassificationExplanation(
+                    primaryMode: .terminal,
+                    confidenceScore: 1.0,
+                    reasons: ["Shell-only routing mode active"],
+                    contributingFactors: ["routing_mode": 1.0],
+                    alternativeModes: []
+                )
+            )
+        }
+
+        // 3. Check for learned patterns from user feedback
         if let learned = feedbackStore.learnedMode(for: trimmed) {
             return ClassificationResult(
                 mode: learned,
@@ -121,54 +136,103 @@ final class InputClassifier {
                 )
             )
         }
-        
-        // 3. Multi-line input analysis
+
+        // 4. Multi-line input analysis
         if trimmed.contains("\n") {
             return classifyMultiline(trimmed, context: context)
         }
-        
-        // 4. Run heuristic scoring
-        let heuristicResult = await classifyWithHeuristics(trimmed, context: context)
-        
-        // 5. If confidence is high enough, return immediately
+
+        // 5. Run synchronous heuristic scoring (shell syntax + PATH/builtin/alias lookup + NL patterns)
+        let heuristicResult = classifyWithHeuristics(trimmed, context: context)
+
         if heuristicResult.confidence >= .high {
             return heuristicResult
         }
-        
-        // 6. For clear queries (what/why/how), always treat as query even without provider
-        // This ensures natural language questions get answered, not sent to shell
+
+        // 6. Expedite recognized shell commands even at medium confidence
+        if heuristicResult.mode == .terminal && heuristicResult.score >= 0.6 {
+            return heuristicResult
+        }
+
+        // 7. Expedite clear natural-language questions without an extra classification round-trip
         if heuristicResult.mode == .query && heuristicResult.score >= 0.4 {
             return ClassificationResult(
                 mode: .query,
-                confidence: .medium,
+                confidence: max(heuristicResult.confidence, .medium),
                 score: heuristicResult.score,
                 explanation: ClassificationExplanation(
                     primaryMode: .query,
                     confidenceScore: heuristicResult.score,
-                    reasons: ["Natural language query detected (no AI provider configured, will use basic response)"],
+                    reasons: heuristicResult.explanation.reasons,
                     contributingFactors: heuristicResult.explanation.contributingFactors,
                     alternativeModes: [.terminal]
                 )
             )
         }
-        
-        // 7. If we have a provider, use LLM for ambiguous cases
+
+        // 8. Expedite clear natural-language command generation requests without an extra classification round-trip
+        if heuristicResult.mode == .aiToShell && heuristicResult.score >= 0.45 {
+            return ClassificationResult(
+                mode: .aiToShell,
+                confidence: max(heuristicResult.confidence, .medium),
+                score: heuristicResult.score,
+                explanation: heuristicResult.explanation
+            )
+        }
+
+        // 9. Multi-word natural language fallback when the first word is NOT a valid shell command/builtin/alias
+        let tokens = shellTokens(trimmed)
+        if tokens.count >= 2 && calculateCommandScore(trimmed, context: context) == 0 && ShellSyntaxAnalyzer.analyze(trimmed).shellScore < 0.3 {
+            let mode: InputMode = trimmed.hasSuffix("?") ? .query : .aiToShell
+            return ClassificationResult(
+                mode: mode,
+                confidence: .medium,
+                score: 0.65,
+                explanation: ClassificationExplanation(
+                    primaryMode: mode,
+                    confidenceScore: 0.65,
+                    reasons: ["Unrecognized command with multi-word natural language phrasing"],
+                    contributingFactors: ["natural_language_fallback": 0.65],
+                    alternativeModes: [.terminal]
+                )
+            )
+        }
+
+        return nil
+    }
+
+    /// Classifies user input with confidence scoring and explanation
+    func classify(
+        _ input: String,
+        context: ClassificationContext,
+        provider: ModelProvider?,
+        modelID: String?
+    ) async throws -> ClassificationResult? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Fast synchronous pre-parse handles all clear shell commands, prefixes, queries, and NL tasks
+        if let fast = fastClassify(trimmed, context: context, routingMode: .smart) {
+            return fast
+        }
+
+        let heuristicResult = classifyWithHeuristics(trimmed, context: context)
+
+        // If we have a provider, use LLM only for genuinely ambiguous cases
         guard let provider, let modelID, !modelID.isEmpty else {
-            // No LLM available - use heuristic result or mark as uncertain
             if heuristicResult.confidence >= .medium {
                 return heuristicResult
             }
             return nil // Trigger disambiguation
         }
-        
-        // 7. Check cache before calling LLM
+
+        // Check cache before calling LLM
         let cacheKey = "\(trimmed)|\(context.projectType.rawValue)" as NSString
         if let cached = cache.object(forKey: cacheKey),
            Date().timeIntervalSince(cached.timestamp) < 300 { // 5 minute cache
             return cached.result
         }
-        
-        // 8. LLM fallback for ambiguous cases
+
+        // LLM fallback for ambiguous cases
         let llmResult = try await classifyWithLLM(
             trimmed,
             context: context,
@@ -176,42 +240,52 @@ final class InputClassifier {
             modelID: modelID,
             heuristicResult: heuristicResult
         )
-        
+
         // Cache the result
         cache.setObject(
             ClassificationResultCacheEntry(result: llmResult, timestamp: Date()),
             forKey: cacheKey
         )
-        
+
         return llmResult
     }
     
     /// Strips override prefixes from input
     func strippedOverrideInput(_ input: String) -> String {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
         
-        // Handle /chat prefix - strip it for chat mode
-        if trimmed.lowercased().hasPrefix("/chat ") {
+        // Handle /chat, /ask, /cmd prefixes
+        if lower.hasPrefix("/chat ") {
             return String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)
         }
-        if trimmed.lowercased() == "/chat" {
+        if lower == "/chat" {
             return ""
         }
+        if lower.hasPrefix("/ask ") {
+            return String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+        }
+        if lower.hasPrefix("/cmd ") {
+            return String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+        }
+        if trimmed.hasPrefix("??") {
+            return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+        }
         
-        guard let first = trimmed.first, ["!", ">", "$"].contains(first) else { return input }
+        guard let first = trimmed.first, ["!", "?", ">", "$"].contains(first) else { return input }
         return String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
     }
     
     /// Checks if input should force chat/query mode
     func isChatCommand(_ input: String) -> Bool {
-        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.lowercased().hasPrefix("/chat") && !trimmed.lowercased().hasPrefix("/chat-exit") && !trimmed.lowercased().hasPrefix("/chatexit")
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return (trimmed == "/chat" || trimmed.hasPrefix("/chat ")) && !isChatExitCommand(trimmed)
     }
     
     /// Checks if input is chat exit command
     func isChatExitCommand(_ input: String) -> Bool {
-        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.lowercased() == "/chat-exit" || trimmed.lowercased() == "/chatexit"
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["/chat-exit", "/chatexit", "/chat-eixt", "/exit", "/quit"].contains(trimmed)
     }
     
     /// Returns true if input is dangerous (destructive command)
@@ -222,9 +296,13 @@ final class InputClassifier {
     // MARK: - Private Classification Methods
     
     private func forcedMode(for input: String) -> InputMode? {
+        let lower = input.lowercased()
+        if lower.hasPrefix("/ask ") { return .query }
+        if lower.hasPrefix("/cmd ") { return .aiToShell }
+        if input.hasPrefix("??") { return .aiToShell }
         guard let first = input.first else { return nil }
         switch first {
-        case "!": return .query
+        case "!", "?": return .query
         case ">": return .aiToShell
         case "$": return .terminal
         default: return nil
@@ -307,7 +385,7 @@ final class InputClassifier {
     private func classifyWithHeuristics(
         _ input: String,
         context: ClassificationContext
-    ) async -> ClassificationResult {
+    ) -> ClassificationResult {
         
         var scores: [InputMode: Double] = [.terminal: 0, .aiToShell: 0, .query: 0]
         var factors: [String: Double] = [:]
@@ -411,28 +489,62 @@ final class InputClassifier {
         )
     }
     
+    private let naturalLanguageIndicators: Set<String> = [
+        "all", "my", "the", "me", "every", "any", "files", "folders", "directories",
+        "processes", "running", "largest", "smallest", "biggest", "newest", "oldest",
+        "modified", "created", "bigger", "smaller", "larger", "than", "where", "that",
+        "which", "into", "from", "without", "port", "ports", "disk", "memory", "usage",
+        "space", "current", "directory", "folder", "last", "recent", "today", "yesterday",
+        "recursively", "containing", "matching", "named", "called"
+    ]
+
+    /// Returns true when an input starting with an action verb reads like natural language prose rather than shell arguments.
+    private func looksLikeNaturalLanguageAction(_ input: String) -> Bool {
+        let tokens = shellTokens(input)
+        guard tokens.count >= 3, let first = tokens.first?.lowercased() else { return false }
+        guard actionVerbs.contains(first) else { return false }
+
+        let argTokens = Array(tokens.dropFirst())
+        // If any argument is a shell flag (-x, --foo) or explicit path (./, /, ~/), it's a real shell command
+        let hasShellFlagsOrPaths = argTokens.contains { tok in
+            tok.hasPrefix("-") || tok == "." || tok == ".." || tok.hasPrefix("./") || tok.hasPrefix("../") || tok.hasPrefix("/") || tok.hasPrefix("~/")
+        }
+        if hasShellFlagsOrPaths { return false }
+
+        let lowerArgs = Set(argTokens.map { $0.lowercased().trimmingCharacters(in: .punctuationCharacters) })
+        let indicatorMatches = lowerArgs.intersection(naturalLanguageIndicators).count
+        return indicatorMatches >= 1
+    }
+
     private func calculateQueryScore(_ input: String, context: ClassificationContext) -> Double {
         let lowercased = input.lowercased()
         var score: Double = 0
         
-        // Check query prefixes
+        // Check query prefixes (match whole word or phrase prefix)
         for prefix in queryPrefixes {
-            if lowercased.hasPrefix(prefix) {
-                score += 0.4
+            if lowercased == prefix || lowercased.hasPrefix(prefix + " ") || lowercased.hasPrefix(prefix + "?") {
+                // Ensure `which <single-binary>` is treated as the shell command `which`
+                if prefix == "which" {
+                    let tokens = shellTokens(lowercased)
+                    if tokens.count == 2 && !lowercased.hasSuffix("?") {
+                        break
+                    }
+                }
+                score += 0.6
                 break
             }
         }
         
         // Check for question mark
         if lowercased.hasSuffix("?") {
-            score += 0.3
+            score += 0.35
         }
         
         // Check for explanation-seeking words
-        let explanationWords = ["explain", "why", "how does", "what is", "what are", "difference"]
+        let explanationWords = ["explain", "why", "how does", "how do", "how to", "what is", "what are", "what does", "difference", "mean"]
         for word in explanationWords {
             if lowercased.contains(word) {
-                score += 0.2
+                score += 0.25
                 break
             }
         }
@@ -445,46 +557,100 @@ final class InputClassifier {
         return max(0, min(score, 1.0))
     }
     
+    private static let commandWrappers: Set<String> = [
+        "sudo", "env", "time", "nohup", "nice", "caffeinate", "arch", "xargs", "command", "builtin", " noglob", "nocorrect"
+    ]
+
+    private static let gitSubcommands: Set<String> = [
+        "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch", "bundle",
+        "checkout", "cherry", "cherry-pick", "clean", "clone", "commit", "config", "count-objects",
+        "describe", "diff", "difftool", "fetch", "format-patch", "fsck", "gc", "grep", "help",
+        "init", "instaweb", "log", "ls-files", "ls-remote", "ls-tree", "maintenance", "merge",
+        "mergetool", "mv", "notes", "prune", "pull", "push", "range-diff", "rebase", "reflog",
+        "remote", "repack", "replace", "request-pull", "reset", "restore", "rev-list", "rev-parse",
+        "revert", "rm", "shortlog", "show", "show-branch", "sparse-checkout", "stage", "stash",
+        "status", "submodule", "switch", "tag", " verify-commit", "verify-tag", "whatchanged", "worktree"
+    ]
+
+    /// Extracts the effective command token after skipping leading `KEY=VALUE` assignments and wrapper commands (`sudo`, `time`, etc.).
+    private func effectiveCommandToken(from tokens: [String]) -> (command: String, remainingTokens: [String])? {
+        var idx = 0
+        while idx < tokens.count {
+            let tok = tokens[idx]
+            // Skip KEY=VALUE assignments
+            if tok.contains("="), !tok.hasPrefix("-"), let eqIdx = tok.firstIndex(of: "="), eqIdx > tok.startIndex {
+                idx += 1
+                continue
+            }
+            let lower = tok.lowercased()
+            if Self.commandWrappers.contains(lower) {
+                idx += 1
+                // Skip flags passed to the wrapper itself (e.g. `sudo -u root cmd`)
+                while idx < tokens.count && tokens[idx].hasPrefix("-") {
+                    idx += 1
+                }
+                continue
+            }
+            return (tok, Array(tokens.dropFirst(idx + 1)))
+        }
+        return nil
+    }
+
     private func calculateCommandScore(_ input: String, context: ClassificationContext) -> Double {
         let tokens = shellTokens(input)
-        guard let first = tokens.first else { return 0 }
+        guard let (first, remainingTokens) = effectiveCommandToken(from: tokens) else { return 0 }
+        let lowerFirst = first.lowercased()
         let lowercased = input.lowercased()
         
         // If first word looks like a command but is commonly used in queries,
         // and the rest looks like a question, reduce the terminal score
-        if commandLikeQueryWords.contains(first.lowercased()) {
-            // Check if this looks like a natural language query
+        if commandLikeQueryWords.contains(lowerFirst) {
             let restOfInput = lowercased.dropFirst(first.count).trimmingCharacters(in: .whitespaces)
-            // If followed by "is", "are", "does", "do", etc., it's likely a question
             let queryIndicators = ["is", "are", "does", "do", "can", "should", "would", "will"]
-            if queryIndicators.contains(where: { restOfInput.hasPrefix($0) }) || restOfInput.count > 3 {
-                // This is likely a natural language query, not a command invocation
+            if queryIndicators.contains(where: { restOfInput.hasPrefix($0) }) || tokens.count > 2 || lowercased.hasSuffix("?") {
                 Log.debug("classifier", "Detected query pattern with command-like word: \(first)")
-                return 0.05 // Very low score - treat as query
+                return 0.05
+            }
+        }
+
+        // If this starts with an overlapping verb (e.g. `find`, `kill`, `open`, `make`, `sort`)
+        // but the arguments are clearly natural language prose (e.g. "find my largest log files",
+        // "kill all node processes"), let AI-to-Shell win instead of executing raw prose in zsh.
+        if looksLikeNaturalLanguageAction(input) {
+            return 0.15
+        }
+
+        // Special handling for `git`: verify the subcommand or flag is valid shell syntax rather than prose like "git undo my last commit"
+        if lowerFirst == "git", let sub = remainingTokens.first?.lowercased() {
+            if !sub.hasPrefix("-") && !Self.gitSubcommands.contains(sub) && remainingTokens.count >= 2 {
+                let lowerArgs = Set(remainingTokens.map { $0.lowercased().trimmingCharacters(in: .punctuationCharacters) })
+                if !lowerArgs.isDisjoint(with: naturalLanguageIndicators) || !lowerArgs.isDisjoint(with: systemNouns) {
+                    return 0.15
+                }
             }
         }
         
         var score: Double = 0
         
-        // Builtin command
-        if commandResolver.isBuiltin(first) {
-            score += 0.5
+        // Builtin command or common zsh alias
+        if commandResolver.isBuiltin(first) || commandResolver.isCommonAlias(first) {
+            score += 0.85
         }
         
         // Executable in PATH
         if commandResolver.isExecutable(first) {
-            score += 0.4
+            score += 0.85
         }
         
-        // Local executable
-        if first.hasPrefix("/") || first.hasPrefix("./") || first.hasPrefix("../") {
-            score += 0.45
+        // Local executable or path navigation
+        if first.hasPrefix("/") || first.hasPrefix("./") || first.hasPrefix("../") || first.hasPrefix("~/") {
+            score += 0.85
         }
         
         // File in working directory
         if let workingDirectory = context.workingDirectory,
            FileManager.default.fileExists(atPath: workingDirectory.appendingPathComponent(first).path) {
-            score += 0.4
+            score += 0.8
         }
         
         return min(score, 1.0)
@@ -494,27 +660,38 @@ final class InputClassifier {
         let lowercased = input.lowercased()
         let words = shellTokens(lowercased)
         
-        guard let first = words.first else { return 0 }
+        guard let first = words.first, words.count >= 2 else { return 0 }
         
         // Must start with action verb
         guard actionVerbs.contains(first) else { return 0 }
+
+        // If arguments contain explicit shell flags or paths (e.g. `find . -name`, `kill -9 1234`), it's a real shell command
+        let argTokens = Array(words.dropFirst())
+        let hasShellFlagsOrPaths = argTokens.contains { tok in
+            tok.hasPrefix("-") || tok == "." || tok == ".." || tok.hasPrefix("./") || tok.hasPrefix("../") || tok.hasPrefix("/") || tok.hasPrefix("~/")
+        }
+        if hasShellFlagsOrPaths {
+            return 0.05
+        }
+        // `kill <pid>` with numeric PID is a direct terminal command
+        if first == "kill", argTokens.allSatisfy({ $0.allSatisfy(\.isNumber) || $0.hasPrefix("%") }) {
+            return 0.05
+        }
         
-        var score: Double = 0.3  // Base score for action verb
+        var score: Double = 0.45  // Base score for action verb
         
-        // Check for system nouns
-        let wordSet = Set(words)
-        if !wordSet.isDisjoint(with: systemNouns) {
+        // Check for system nouns or natural language indicators
+        let cleanWords = Set(words.map { $0.trimmingCharacters(in: .punctuationCharacters) })
+        if !cleanWords.isDisjoint(with: systemNouns) {
             score += 0.4
+        }
+        if !cleanWords.isDisjoint(with: naturalLanguageIndicators) {
+            score += 0.25
         }
         
         // Negative indicators (question patterns)
         if lowercased.hasSuffix("?") {
             score -= 0.3
-        }
-        
-        // Negative indicators (existing command)
-        if calculateCommandScore(input, context: .basic(workingDirectory: nil, lastCommands: [], lastOutputSnippet: "")) > 0.3 {
-            score -= 0.2
         }
         
         return max(0, min(score, 1.0))
@@ -706,18 +883,34 @@ private final class ClassificationResultCacheEntry: NSObject {
 
 // MARK: - Command Resolver
 
-private final class CommandResolver {
+private final class CommandResolver: @unchecked Sendable {
     private let builtins: Set<String> = [
-        "cd", "echo", "export", "source", "alias", "unset", "fg", "bg",
-        "jobs", "kill", "exit", "history", "pwd", "pushd", "popd", "type",
-        "which", "eval", "return", "shift", "test", "[", "[[",
-        "true", "false", "read", "printf", "break", "continue"
+        "cd", "echo", "export", "source", ".", ":", "alias", "unalias", "unset", "fg", "bg",
+        "jobs", "kill", "exit", "logout", "history", "fc", "pwd", "pushd", "popd", "dirs", "type",
+        "which", "where", "whence", "eval", "exec", "return", "shift", "test", "[", "[[",
+        "true", "false", "read", "printf", "print", "break", "continue", "clear", "reset",
+        "set", "setopt", "unsetopt", "bindkey", "autoload", "ulimit", "umask", "wait", "trap",
+        "local", "declare", "typeset", "readonly", "let", "getopts", "hash", "rehash", "disown",
+        "suspend", "times", "emulate", "zle", "zmodload", "zstyle", "compdef"
+    ]
+    private let commonAliases: Set<String> = [
+        "ll", "la", "l", "lsa", "md", "rd", "..", "...", "....", ".....", "~", "-",
+        "g", "ga", "gaa", "gb", "gba", "gbm", "gbd", "gc", "gca", "gcam", "gcb", "gcm", "gcmsg",
+        "gco", "gcp", "gd", "gds", "gf", "gfa", "gl", "glog", "glol", "glola", "gm", "gp", "gpf",
+        "gpr", "gpu", "gr", "gra", "grb", "grbi", "grbc", "grba", "grh", "grhh", "grm", "grs",
+        "grst", "grv", "gsb", "gsh", "gsi", "gsta", "gstaa", "gstc", "gstd", "gstl", "gstp",
+        "gsts", "gst", "gsu", "gsw", "gtl", "gts", "gwch",
+        "cls", "dir", "vdir", "py", "py3", "ipy", "k", "tf", "dc", "dcu", "dcd", "dcl"
     ]
     private var executableCache: [String: Bool] = [:]
     private var cacheQueue = DispatchQueue(label: "com.aterm.commandresolver")
     
     func isBuiltin(_ command: String) -> Bool {
         builtins.contains(command)
+    }
+
+    func isCommonAlias(_ command: String) -> Bool {
+        commonAliases.contains(command)
     }
     
     func isExecutable(_ command: String) -> Bool {
@@ -726,9 +919,23 @@ private final class CommandResolver {
             return cached
         }
         
-        let searchPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+        let envPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
             .split(separator: ":")
             .map(String.init)
+        let standardPaths = [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+            "\(NSHomeDirectory())/.cargo/bin",
+            "\(NSHomeDirectory())/.local/bin",
+        ]
+        var seen = Set<String>()
+        let searchPaths = (envPaths + standardPaths).filter { seen.insert($0).inserted }
         
         let exists = searchPaths.contains { path in
             FileManager.default.isExecutableFile(

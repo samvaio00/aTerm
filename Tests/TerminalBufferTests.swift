@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import aTerm
 
 @MainActor
@@ -240,7 +241,7 @@ struct TerminalBufferTests {
     func eraseInDisplayClearsScrollback() {
         let buffer = TerminalBuffer(columns: 10, rows: 3)
         // Fill screen and scroll some lines
-        for i in 0..<5 {
+        for _ in 0..<5 {
             buffer.moveCursorTo(x: 0, y: 2)
             buffer.putChar(Character("A"))
             buffer.lineFeed()
@@ -505,5 +506,31 @@ struct TerminalBufferTests {
         
         #expect(buffer.lastCommandExitCode == 42)
         #expect(buffer.lastCommandDuration == 1.5)
+    }
+
+    @Test
+    func tracksForegroundCommandExecutionAndPromptState() {
+        let buffer = TerminalBuffer(columns: 80, rows: 24)
+        let parser = VT100Parser(buffer: buffer)
+
+        // Simulate OSC 133;A (prompt start) -> print prompt -> OSC 133;B (input start)
+        parser.feed(Data("\u{1B}]133;A\u{07}user@mac ~ % \u{1B}]133;B\u{07}".utf8))
+        #expect(buffer.isAtShellPrompt == true)
+        #expect(buffer.shellInputStartColumn == 13)
+
+        // Simulate typing a command with mid-line cursor movement (e.g., left arrow)
+        parser.feed(Data("what is git rebase?".utf8))
+        buffer.moveCursorBackward(7) // Move cursor into the middle of the typed line
+        #expect(buffer.userInputForSmartClassification() == "what is git rebase?")
+
+        // Simulate OSC 133;C (foreground command execution start)
+        parser.feed(Data("\r\n\u{1B}]133;C\u{07}".utf8))
+        #expect(buffer.isAtShellPrompt == false)
+        #expect(buffer.shellInputStartColumn == nil)
+
+        // Simulate OSC 133;D;0 (command finished) -> OSC 133;A -> OSC 133;B
+        parser.feed(Data("\u{1B}]133;D;0\u{07}\u{1B}]133;A\u{07}user@mac ~ % \u{1B}]133;B\u{07}".utf8))
+        #expect(buffer.isAtShellPrompt == true)
+        #expect(buffer.lastCommandExitCode == 0)
     }
 }
